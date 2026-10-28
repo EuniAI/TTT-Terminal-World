@@ -1,0 +1,47 @@
+# 正式训练模板：除 inner_clip_norm 可保留 null（不裁剪）外，其余 null 都必须填写。
+# 当前导入路径仅支持无投影 bias、SwiGLU、未缩放 RoPE 的标准 Llama。
+# hidden_size、intermediate_size、层数、Query/KV 头数、RoPE、归一化和共享 embedding
+# 等架构参数从指定底座读取；词表在底座基础上增加 6 个协议 token。
+# θ 为通用参数，φ 为新增 prime MLP 的 fast weights；φ 跨窗口/轨迹/epoch 持续保留。
+model:
+  # Hugging Face 预训练模型标识或本地权重路径；须符合上述导入限制。
+  model_id: null
+  # 固定底座版本：必须是完整的 40 位小写十六进制 commit SHA，不能填 main。
+  revision: null
+  # 最后多少层增加可适应的 prime MLP，范围为 1 到底座总层数。
+  # 只有 prime MLP 的 gate/up/down 权重属于 φ；普通 MLP 和 normalization 仍属于 θ。
+  # 第一层适应 block 之前是可批量计算的 prefix，其后是必须顺序更新的 suffix。
+  adaptive_layers: null
+  # 单事件最大序列长度，不能超过底座 max_position_embeddings。
+  # 完整 prompt + max_output_tokens 必须能放下；命令不截断，超长直接报错。
+  max_seq_len: 4096
+  # 使用 FlashBoB 的因果 attention；当前适配器要求 CUDA 和固定 commit 的依赖。
+  # 代码检查 PyTorch 2.8/Triton 3.4 或 2.9/3.5；每头维度须为 32/64/128。
+  # GQA/MQA 还要求 BF16、Query/KV 头数比 <= 32；不兼容时不自动回退到 math。
+  # 接口已接入不等于已完成正式底座上的 GPU 二阶梯度和性能验收。
+  attention_backend: flashbob
+  # 模型与 φ 使用 BF16；低精度 logits 的交叉熵计算转为 FP32。
+  dtype: bfloat16
+training:
+  # 内循环无动量 SGD 学习率：每个事件更新一次 φ；需填写正数并通过实验选择。
+  inner_lr: null
+  # 外循环 AdamW 学习率：每个窗口更新一次 θ；需填写正数。
+  outer_lr: null
+  # 每个元梯度窗口的事件数（含 open/close），必须 >= 2；尾窗口可不足此长度。
+  # 窗口内保留二阶梯度，窗口间只切图；更长窗口通常增加显存需求。
+  # 实验需检查 close → open → 后续 shell 是否落在同一窗口，以覆盖跨轨迹更新效果。
+  unroll_events: null
+  # 每组批量计算 prefix 的事件数，必须 >= 1；与元梯度窗口大小是不同概念。
+  # 可用较小的连续分组控制前段批量计算规模，suffix 始终按事件顺序更新 φ。
+  prefix_batch_size: null
+  # 输出 token 预算（使用底座 tokenizer），训练和生成共用，包含 OBS_END。
+  # 训练保留 (正文 + OBS_END) 的前 N 个 token；生成最多 N 个或遇 OBS_END 停止。
+  max_output_tokens: 2048
+  # 可选的内循环全局梯度范数裁剪：null 为关闭，正数为阈值。
+  # 裁剪可微，并在训练、评估、在线适应中使用相同配置。
+  inner_clip_norm: null
+  # AdamW 对 θ 的权重衰减，0 为关闭；内循环 φ 不应用权重衰减。
+  outer_weight_decay: 0.0
+  # 首次运行的 Python/PyTorch 随机种子；续训恢复检查点中的随机状态。
+  # 不控制 manifest 的数据划分，也不会在每个窗口重新初始化 φ。
+  seed: 0

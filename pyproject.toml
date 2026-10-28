@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminal-world"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.8", "PyYAML>=6,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+pretrained = ["transformers==4.57.1", "tokenizers==0.22.1", "safetensors==0.6.2"]
+
+[tool.setuptools.packages.find]
+include = ["terminal_world*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["cuda: requires the pinned FlashBoB CUDA environment"]

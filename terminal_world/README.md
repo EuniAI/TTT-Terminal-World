@@ -1,0 +1,65 @@
+# Terminal world model
+
+实现入口是 `python -m terminal_world.train`。当前提供可运行的微型模型、持久 fast weights、元训练、独立评估、Session 和检查点；正式预训练底座通过标准 Llama 导入器接入。
+
+## 本地验证
+
+从仓库根目录运行：
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest -q
+python -m terminal_world.dataloader.trajectory terminal_trajs_llm.jsonl --output /tmp/terminal-manifest.json
+python -m terminal_world.train --config configs/experiment/tiny.yaml --manifest /tmp/terminal-manifest.json --output /tmp/terminal-tiny.pt --max-windows 2
+python -m terminal_world.train --resume /tmp/terminal-tiny.pt --manifest /tmp/terminal-manifest.json --output /tmp/terminal-tiny.pt --max-windows 2
+python -m terminal_world.evaluate --checkpoint /tmp/terminal-tiny.pt --exposure-label first-validation
+python -m terminal_world.evaluate --checkpoint /tmp/terminal-tiny.pt --frozen --exposure-label same-checkpoint-frozen-comparison
+```
+
+Manifest 创建时读取完整文件并记录 SHA256、原始行号、字节位置和划分。重复轨迹按内容归入相同划分；各划分内保留原始顺序。训练和恢复校验文件摘要。不要手工改 manifest 或在训练期间改原始 JSONL。小数据可能没有验证样本，评估会显式报错。
+
+tiny 使用 UTF-8 byte tokenizer，默认 output 预算仍是 2048；它用于算法验证，不能据此评价正式模型预测能力。CPU 上可用 `OMP_NUM_THREADS=1` 减少小矩阵的线程调度成本。长命令不会被截断，超过模型容量会报错。训练读取已记录返回，绝不重新执行 shell。
+
+`--epochs` 是总目标 epoch 数，`--max-windows` 是本次额外运行窗口数。每个成功窗口原子保存 θ、当前 φ、AdamW、游标、协议状态、配置、tokenizer、manifest 和随机状态。epoch 切换只移动游标；不会重置 φ。恢复时通常不再传 `--config`，使用 checkpoint 内实际配置。异常退出后从最近成功提交的 checkpoint 恢复。
+
+## 正式底座与 FlashBoB
+
+在独立 CUDA 环境安装固定依赖，然后填写 `configs/experiment/terminal_ttt.yaml` 的空项：
+
+```bash
+python -m pip install -r requirements-training-cuda.txt
+python -m pip install -e . --no-deps
+python -m pytest tests/test_flashbob.py -v
+python -m terminal_world.benchmark --prefix-batch-size 3 --output-length 128
+python -m terminal_world.train --config configs/experiment/terminal_ttt.yaml --manifest /tmp/terminal-manifest.json --output /path/to/run.pt --device cuda
+```
+
+`model_id` 必须指向用户选定的普通 Llama 底座，`revision` 必须是完整 commit SHA。层数、head 数、词表等从底座读取；适应层数、上下文容量和训练超参数由配置指定。导入前保留原网络路径，新增 prime MLP 的 down projection 为零，其他投影正常初始化；在允许训练前比较原词表 logits。正式规模需看启动时报告的 θ/φ 数量：新增支路也计入总参数，不能仅凭底座名称声称约 1B。
+
+目前导入器只支持 **无 bias、SwiGLU、标准未缩放 RoPE 的 Llama**。Llama 3 的 scaled RoPE、Qwen 和官方 e2e checkpoint 不能直接导入，会报错；尚未选择或下载正式底座。导入会同时保留参考模型和目标模型做对比，需要额外内存。HF chat template 不进入模型输入。
+
+FlashBoB 固定到 `f2bd4a38a9b65bae455ef4336d7b54f0acd3caca`，安装必须保留 pip VCS commit 元数据；不接受来源不明的同名包。启动检查 CUDA、PyTorch/Triton、dtype 和 head 配置，不静默切回 math。CPU 只能选择 math。显式参数前向避免了在 FlashBoB 外套 `torch.func` 变换。
+
+CUDA 测试覆盖 MHA/GQA、前向、一阶/二阶导数、混合长度右 padding、多次更新的最终 φ 与 θ 元梯度。测试中列明 BF16 容差；真实底座还需在所选尺寸、硬件上扩展验证。benchmark 测完整窗口内外循环、首次运行时间、预热后的耗时和峰值分配显存，不包含 checkpoint I/O；它不是正式 1B 吞吐结论。正确性测试通过后再采信性能比较。
+
+## 在线 Session
+
+```python
+from terminal_world.checkpoint import resume_session
+
+session = resume_session('/path/to/run.pt', device='cuda')
+if not session.is_open:
+    session.control('open')
+prediction = session.predict('cat note.txt')
+# real_output 由外部一次性执行器提供，不在 Session 内执行命令。
+score = session.observe('cat note.txt', real_output)
+session.control('close')
+```
+
+每次 observe/control 只更新一次 φ，predict 不学习。调用方负责把同一条真实返回交付一次；接口不依靠 command 文本去重，因为重复命令可能产生不同返回。用 `save_session` 保存在线状态，`resume_session` 保留开闭状态；Session checkpoint 不可用于恢复 AdamW 训练。checkpoint 只从可信本地来源加载，不保存 Docker 文件系统。
+
+生成暂用贪心全前缀重算，没有 KV cache；这保持语义正确但生成吞吐较低。离线训练的前段 batch 优化不用于未知未来 command/output。评估从 θ/φ 的副本开始，frozen 模式禁用所有事件更新；若训练 checkpoint 处于 open 状态，在副本上先执行 close 再打开验证轨迹。评估不会写回训练记忆。
+
+当前指标包含 token 加权 NLL、控制事件损失/更新范数、裁剪率、截断分类、结束标签覆盖及窗口内跨边界覆盖。评估加 `--generate` 可统计完整正文/保留前缀匹配率和含结束 token 的准确率，不评价缺失的尾部。覆盖率为零的窗口配置会报告提示，不能据此声称已验证跨轨迹元学习。
+
+本地验证环境：CPU、PyTorch 2.13.0。FlashBoB CUDA 测试和实际预训练 checkpoint 对比需在对应依赖/硬件环境执行，当前不能宣称通过或获得加速。

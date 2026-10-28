@@ -1,0 +1,57 @@
+# 微型模型：随机初始化，用于验证编码、内外循环和恢复逻辑，不是正式预训练底座。
+# θ 是通用模型参数；φ 是独立保存、每个事件更新一次的 prime MLP 权重（fast weights）。
+# φ 跨窗口、轨迹和 epoch 保留；窗口结束只截断计算图，不重置其数值。
+model:
+  # 模型来源；tiny-random 走本地随机模型 + ByteTokenizer 路径，不下载权重。
+  model_id: tiny-random
+  # 本地微型模型的版本标识；正式预训练模型改用固定的完整 commit SHA。
+  revision: native-v1
+  # 每个 token 的隐藏向量维度，也是 embedding 和残差流的宽度。
+  hidden_size: 32
+  # 普通 MLP 和 prime MLP 的中间维度；gate/up 从 32 映射到 64，down 再映射回 32。
+  intermediate_size: 64
+  # Transformer block 总数。
+  num_layers: 2
+  # Query 注意力头数；hidden_size 必须能被它整除，本例每头维度为 32 / 4 = 8。
+  # RoPE 要求每头维度为偶数；此处的 8 适用于 math，不满足 FlashBoB 的维度限制。
+  num_heads: 4
+  # Key/Value 头数；与 Query 头数相同是普通 MHA，较少则是 GQA（为 1 时是 MQA）。
+  # num_heads 必须能被 num_kv_heads 整除。
+  num_kv_heads: 4
+  # 在最后多少个 block 中增加 prime MLP，范围为 1 到 num_layers。
+  # 本例第一层是仅依赖 θ 的 prefix，第二层是依赖 θ/φ 的 suffix。
+  adaptive_layers: 1
+  # 单事件序列容量；完整 prompt（命令 + 协议标记）加输出预算不能超过它。
+  # 命令不会被静默截断，超过容量会报错；它不是跨事件的历史上下文长度。
+  max_seq_len: 4096
+  # attention 实现：math 是支持二阶求导的数学基准，可在 CPU 上验证。
+  # flashbob 需要 CUDA、指定依赖版本及支持的精度/head 配置，不满足时会报错。
+  attention_backend: math
+  # 模型及 fast weights 的浮点精度；可选 float32/float64/bfloat16/float16。
+  dtype: float32
+# 未写出的模型字段使用 config.py 默认值：vocab_size=262（256 字节 + 6 个协议 token）、
+# rope_theta=10000.0（RoPE 频率基数）、rms_norm_eps=1e-6（归一化稳定项）、
+# tie_embeddings=false（输入 embedding 与输出头不共享权重）。
+training:
+  # 内循环 SGD 学习率 α：每个真实返回或 open/close 事件更新一次 φ，必须大于 0。
+  inner_lr: 0.01
+  # 外循环 AdamW 学习率：每个窗口更新一次 θ，不直接更新 φ，必须大于 0。
+  outer_lr: 0.0001
+  # 一个元梯度窗口最多包含多少个事件，包含 open/close，必须 >= 2。
+  # 窗口内保留穿过 SGD 更新的二阶梯度；值越大，通常需要保留更多计算图。
+  # 不拆分事件；末尾不足此数量的窗口照常处理。
+  unroll_events: 4
+  # 每次批量计算 prefix 的事件数，必须 >= 1；按各组最大长度做右侧 padding。
+  # 只改变前段计算调度：suffix 仍按原顺序处理，每个事件各更新一次 φ。
+  prefix_batch_size: 4
+  # 目标/生成的最大 token 数，包含 OBS_END 的预算；本模型 token 按 UTF-8 字节编码。
+  # 训练目标为 (正文 + OBS_END)[:预算]，截断后不补结束标记；生成遇 OBS_END 提前停止。
+  max_output_tokens: 2048
+  # 内循环梯度全局范数裁剪阈值；null 表示不裁剪，也可填写正数。
+  # 启用后使用可微裁剪，同一规则用于训练、评估和在线适应。
+  inner_clip_norm: null
+  # 外循环 AdamW 对 θ 的权重衰减，0 表示关闭；φ 的内循环没有 weight decay。
+  outer_weight_decay: 0.0
+  # 首次训练时的 Python/PyTorch 随机种子；恢复时加载检查点的随机状态。
+  # 数据划分由 manifest 的 split_seed 决定，此项不改变已保存的数据顺序。
+  seed: 0

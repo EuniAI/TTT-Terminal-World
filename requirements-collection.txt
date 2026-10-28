@@ -1,0 +1,5 @@
+# Native bash tool calling and DefaultAgent Python API.
+mini-swe-agent==2.4.6
+
+# LiteLLM tool-call path may import MCP types even for plain bash tools.
+mcp>=2.3.0,<3

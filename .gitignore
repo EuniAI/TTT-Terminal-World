@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+# Model artifacts are large and should be stored in an explicit run directory.
+runs/
+.idea/
