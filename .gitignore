@@ -8,3 +8,4 @@ dist/
 # Model artifacts are large and should be stored in an explicit run directory.
 runs/
 .idea/
+wandb/

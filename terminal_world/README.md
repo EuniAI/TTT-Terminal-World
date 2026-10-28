@@ -2,6 +2,8 @@
 
 完整训练操作步骤见 [Qwen2.5-Coder-3B 训练指南](../terminal-world-training-guide.md)，包含环境安装、数据清单、首次试跑、恢复、正式训练和评估。
 
+可选 W&B：安装 `python -m pip install -e '.[tracking]'` 并执行 `wandb login`，训练时加 `--wandb-project terminal-world`；续训加 `--wandb-mode online`，自动使用 checkpoint 中保存的 run 身份。`--wandb-mode offline` 分段保存本地日志，`--wandb-new-run` 可分叉日志。不启用时保持本地训练；详细指标、恢复规则和离线同步见训练指南第 12 节。
+
 实现入口是 `python -m terminal_world.train`。当前提供可运行的微型模型、持久 fast weights、元训练、独立评估、Session 和检查点；正式预训练底座支持标准 Llama 和 Qwen2 导入，当前实验配置选用 Qwen2.5-Coder-3B Base。
 
 ## 本地验证

@@ -11,6 +11,7 @@ dependencies = ["torch>=2.8", "PyYAML>=6,<7"]
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
 pretrained = ["transformers==4.57.1", "tokenizers==0.22.1", "safetensors==0.6.2"]
+tracking = ["wandb>=0.19,<1"]
 
 [tool.setuptools.packages.find]
 include = ["terminal_world*"]
