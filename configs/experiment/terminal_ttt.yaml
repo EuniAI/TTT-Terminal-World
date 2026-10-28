@@ -38,7 +38,7 @@ training:
   # 内循环无动量 SGD 学习率：每个事件更新一次 φ；起步值，需实验调优。
   inner_lr: 0.10
   # 外循环 AdamW 峰值学习率；每个窗口更新一次 θ。
-  outer_lr: 0.0004
+  outer_lr: 0.0005
   # 首次启动按 ceil(训练事件数 / unroll_events) * epochs 固定调度长度。
   # 从 0 线性预热，再余弦衰减；恢复沿用检查点计划，不重新预热。
   outer_lr_schedule: warmup_cosine
