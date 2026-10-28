@@ -67,6 +67,30 @@ def _import_decoder(reference, options, *, model_type, device):
     return model, fast, config
 
 
+def _alignment_diagnostics(model, fast, probe, actual, expected, tolerance):
+    """Failure-only comparison; never substitute a backend for training."""
+    def summarize(label, result, target):
+        delta = (result - target).abs()
+        mismatches = (~torch.isclose(result, target, atol=tolerance, rtol=tolerance)).sum().item()
+        return (f"{label}: mismatched={mismatches}/{target.numel()}, "
+                f"max_abs={delta.max().item():.6g}, mean_abs={delta.mean().item():.6g}")
+
+    lines = [summarize("configured adapter vs HF eager", actual, expected)]
+    backend = model.config.attention_backend
+    if backend == "flashbob":
+        try:
+            model.config.attention_backend = "math"
+            with torch.no_grad():
+                baseline = model(probe, fast)[..., :expected.shape[-1]].float().cpu()
+            lines.append(summarize("math adapter vs HF eager", baseline, expected))
+            lines.append(summarize("FlashBoB adapter vs math adapter", actual, baseline))
+        except RuntimeError as error:
+            lines.append(f"math diagnostic failed: {error}")
+        finally:
+            model.config.attention_backend = backend
+    return "\n".join(lines)
+
+
 def load_pretrained(options, *, device="cpu"):
     if not re.fullmatch(r"[0-9a-f]{40}", options.revision):
         raise ValueError("pretrained revision must be a full commit SHA")
@@ -108,7 +132,8 @@ def load_pretrained(options, *, device="cpu"):
                 f"adapter_device={next(model.parameters()).device}, "
                 f"adapter_backend={config.attention_backend}, "
                 f"torch={torch.__version__}, cuda={torch.version.cuda}\n"
-                f"{details}"
+                f"{details}\n"
+                + _alignment_diagnostics(model, fast, probe, actual, expected, tolerance)
             ),
         )
     return model, fast, encoded, config

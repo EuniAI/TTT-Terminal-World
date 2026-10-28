@@ -7,6 +7,31 @@ from terminal_world.model.transformer import TerminalTransformer
 from terminal_world.config import ModelConfig
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_alignment_diagnostic_restores_backend(fail):
+    from terminal_world.model.pretrained import _alignment_diagnostics
+
+    class DiagnosticModel:
+        config = SimpleNamespace(attention_backend="flashbob")
+
+        def __call__(self, probe, fast):
+            assert self.config.attention_backend == "math"
+            assert not torch.is_grad_enabled()
+            if fail:
+                raise RuntimeError("diagnostic unavailable")
+            return torch.zeros(1, 2, 3)
+
+    model = DiagnosticModel()
+    report = _alignment_diagnostics(model, {}, torch.ones(1, 2, dtype=torch.long),
+                                    torch.ones(1, 2, 3), torch.zeros(1, 2, 3), 0.04)
+    assert model.config.attention_backend == "flashbob"
+    assert "mismatched=6/6" in report
+    if fail:
+        assert "math diagnostic failed: diagnostic unavailable" in report
+    else:
+        assert "math adapter vs HF eager: mismatched=0/6" in report
+
+
 def test_import_mapping_and_old_vocabulary_logits():
     config = ModelConfig(vocab_size=30, hidden_size=8, intermediate_size=12, num_heads=2, num_kv_heads=1,
                          max_seq_len=128, dtype="float64", tie_embeddings=True)
