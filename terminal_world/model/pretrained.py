@@ -74,7 +74,7 @@ def load_pretrained(options, *, device="cpu"):
     reference = AutoModelForCausalLM.from_pretrained(
         options.model_id, revision=options.revision, torch_dtype=options.torch_dtype,
         attn_implementation="eager", trust_remote_code=False,
-    ).eval()
+    ).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(options.model_id, revision=options.revision,
                                               use_fast=True, trust_remote_code=False)
     if not tokenizer.is_fast or len(tokenizer) > reference.config.vocab_size:
@@ -95,10 +95,20 @@ def load_pretrained(options, *, device="cpu"):
         ids = encoded.encode_text(text)
         if ids != tokenizer.encode(text, add_special_tokens=False):
             raise ValueError("serialized tokenizer changed ordinary-text encoding")
-        probe = torch.tensor([ids[:config.max_seq_len]], dtype=torch.long)
+        probe = torch.tensor([ids[:config.max_seq_len]], dtype=torch.long, device=device)
         with torch.no_grad():
             expected = reference(probe, use_cache=False).logits.float().cpu()
-            actual = model(probe.to(device), fast)[..., :base_vocab].float().cpu()
-        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance,
-                                   msg="imported adapter did not preserve base logits")
+            actual = model(probe, fast)[..., :base_vocab].float().cpu()
+        torch.testing.assert_close(
+            actual, expected, atol=tolerance, rtol=tolerance,
+            msg=lambda details: (
+                "imported adapter did not preserve base logits\n"
+                f"probe={text!r}, tokens={probe.shape[1]}, dtype={options.dtype}, "
+                f"reference_device={next(reference.parameters()).device}, "
+                f"adapter_device={next(model.parameters()).device}, "
+                f"adapter_backend={config.attention_backend}, "
+                f"torch={torch.__version__}, cuda={torch.version.cuda}\n"
+                f"{details}"
+            ),
+        )
     return model, fast, encoded, config
