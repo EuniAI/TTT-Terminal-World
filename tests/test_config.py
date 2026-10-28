@@ -25,3 +25,12 @@ def test_tiny_config_valid():
     config = RunConfig.load("configs/experiment/tiny.yaml")
     assert config.training.max_output_tokens == 2048
     assert config.model.attention_backend == "math"
+
+
+def test_legacy_training_config_keeps_constant_learning_rate():
+    data = RunConfig.load("configs/experiment/tiny.yaml").to_dict()
+    for key in ("outer_lr_schedule", "outer_warmup_ratio", "outer_end_lr"):
+        del data["training"][key]
+    restored = RunConfig.from_dict(data)
+    assert restored.training.outer_lr_schedule == "constant"
+    assert restored.training.outer_lr == data["training"]["outer_lr"]

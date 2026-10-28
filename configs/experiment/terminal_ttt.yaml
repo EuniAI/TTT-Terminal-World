@@ -37,8 +37,13 @@ model:
 training:
   # 内循环无动量 SGD 学习率：每个事件更新一次 φ；起步值，需实验调优。
   inner_lr: 0.10
-  # 外循环 AdamW 学习率：每个窗口更新一次 θ；起步值，需实验调优。
-  outer_lr: 0.00001
+  # 外循环 AdamW 峰值学习率；每个窗口更新一次 θ。
+  outer_lr: 0.0004
+  # 首次启动按 ceil(训练事件数 / unroll_events) * epochs 固定调度长度。
+  # 从 0 线性预热，再余弦衰减；恢复沿用检查点计划，不重新预热。
+  outer_lr_schedule: warmup_cosine
+  outer_warmup_ratio: 0.1
+  outer_end_lr: 0.00001
   # 每个元梯度窗口的事件数（含 open/close），必须 >= 2；尾窗口可不足此长度。
   # 窗口内保留二阶梯度，窗口间只切图；更长窗口通常增加显存需求。
   # 实验需检查 close → open → 后续 shell 是否落在同一窗口，以覆盖跨轨迹更新效果。

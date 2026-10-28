@@ -89,6 +89,14 @@ OMP_NUM_THREADS=1 python -m terminal_world.train \
 
 Keep the manifest and source data unchanged when resuming. `--epochs` sets the total target epoch count; increase it if the saved run has already reached that target.
 
+## Learning rates for the Qwen experiment
+
+`configs/experiment/terminal_ttt.yaml` uses an inner SGD learning rate of `0.10` with global gradient norm clipping at `1.0`. The outer AdamW learning rate starts at zero, warms up linearly to `4e-4` over the first 10% of planned windows, then follows a cosine decay to `1e-5` on the final window. These are experiment settings, not tuned results.
+
+The schedule length is fixed at the first launch: `ceil(training events / unroll_events) × epochs`, including each epoch's partial final window. Set `--epochs` to the intended total even for a short `--max-windows` trial. The checkpoint saves the schedule plan and completed window count, so resuming does not restart warmup. Extending beyond the original plan keeps the learning rate at `1e-5`.
+
+Scheduled runs need at least three planned windows; for very short runs, warmup is capped to leave a peak and final decay step. The tiny configuration and older checkpoints retain their constant learning rate. Both learning rates are included in the training logs.
+
 ## Want to dig deeper?
 
 | What you're looking for | Start here |

@@ -14,6 +14,7 @@ from terminal_world.metrics import summarize
 from terminal_world.model.loop import TrainingState, train_window
 from terminal_world.model.transformer import create_model
 from terminal_world.tracking import start_tracker
+from terminal_world.schedule import make_schedule, outer_learning_rate
 
 
 def run(args):
@@ -59,6 +60,13 @@ def run(args):
                   "backend": config.model.attention_backend, "device": args.device}
     print(json.dumps(model_info), flush=True)
     extra = dict(previous.get("extra", {}))
+    if not args.resume:
+        plan = make_schedule(config.training, stream.total_events, args.epochs)
+        if plan is not None:
+            extra["outer_lr_plan"] = plan
+    plan = extra.get("outer_lr_plan")
+    # Fail before writing a checkpoint if a scheduled resume lost its horizon.
+    outer_learning_rate(config.training, state.windows_completed, plan)
     with start_tracker(args, config, state, model_info, stream.digest, extra.get("wandb")) as tracker:
         if tracker.identity is not None:
             extra["wandb"] = tracker.identity
@@ -68,10 +76,10 @@ def run(args):
                             manifest, stream.digest, extra=extra)
         # Save identity before the first window, including when enabling logging on an old run.
         commit()
-        _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker)
+        _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker, plan)
 
 
-def _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker):
+def _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker, plan=None):
     completed = 0
     while state.epoch < args.epochs:
         for window in windows(stream.from_cursor(state.next_cursor), encoder, config.training.unroll_events,
@@ -81,6 +89,9 @@ def _train_windows(args, model, state, optimizer, config, encoder, stream, cover
                 torch.cuda.synchronize(next(model.parameters()).device)
                 torch.cuda.reset_peak_memory_stats(next(model.parameters()).device)
             started = time.perf_counter()
+            lr = outer_learning_rate(config.training, state.windows_completed, plan)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
             loss, records = train_window(model, optimizer, state, window, config.training, pad_id=encoder.tokenizer.ids["pad"])
             if cuda_timing:
                 torch.cuda.synchronize(next(model.parameters()).device)
@@ -98,15 +109,14 @@ def _train_windows(args, model, state, optimizer, config, encoder, stream, cover
             checkpoint_seconds = time.perf_counter() - checkpoint_started
             metrics = summarize(records)
             metrics.update(loss=loss, epoch=state.epoch, cursor=state.next_cursor,
-                           windows=state.windows_completed, boundary_coverage=coverage)
+                           windows=state.windows_completed, boundary_coverage=coverage,
+                           inner_lr=config.training.inner_lr, outer_lr=lr)
             if tracker.enabled:
                 metrics["performance"] = {
                     "window_compute_seconds": compute_seconds,
                     "checkpoint_seconds": checkpoint_seconds,
                     "target_tokens_per_second": sum(r["tokens"] for r in records) / compute_seconds,
                 }
-                metrics["inner_lr"] = config.training.inner_lr
-                metrics["outer_lr"] = optimizer.param_groups[0]["lr"]
                 triples = coverage["triples"]
                 metrics["boundary_coverage"] = dict(coverage)
                 metrics["boundary_coverage"]["rate"] = coverage["covered"] / triples if triples else None

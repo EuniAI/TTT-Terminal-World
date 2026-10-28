@@ -68,6 +68,9 @@ class TrainConfig:
     inner_clip_norm: float | None = None
     outer_weight_decay: float = 0.0
     seed: int = 0
+    outer_lr_schedule: str = "constant"
+    outer_warmup_ratio: float = 0.1
+    outer_end_lr: float = 1e-5
 
     def validate(self):
         missing = [k for k, v in asdict(self).items() if v is None and k != "inner_clip_norm"]
@@ -84,6 +87,14 @@ class TrainConfig:
             raise ValueError("inner_clip_norm must be finite and positive")
         if not math.isfinite(self.outer_weight_decay) or self.outer_weight_decay < 0:
             raise ValueError("invalid outer weight decay")
+        if self.outer_lr_schedule not in ("constant", "warmup_cosine"):
+            raise ValueError("unknown outer_lr_schedule")
+        if not math.isfinite(self.outer_warmup_ratio) or not 0 <= self.outer_warmup_ratio < 1:
+            raise ValueError("outer_warmup_ratio must be in [0, 1)")
+        if not math.isfinite(self.outer_end_lr) or self.outer_end_lr < 0:
+            raise ValueError("outer_end_lr must be finite and nonnegative")
+        if self.outer_lr_schedule == "warmup_cosine" and self.outer_end_lr > self.outer_lr:
+            raise ValueError("outer_end_lr must not exceed the peak outer_lr")
 
 
 @dataclass
