@@ -77,19 +77,30 @@ OMP_NUM_THREADS=1 python -m terminal_world.train \
   --max-windows 2
 ```
 
-The tiny model checks that the training pipeline works; two windows won't make it a terminal expert. For another run, choose a new output directory or use `--resume` to continue from the existing checkpoint as described in the training guide.
+The tiny model checks that the training pipeline works; two windows won't make it a terminal expert. For a fresh run, choose a new output directory. To continue from the saved checkpoint for up to two more windows:
+
+```bash
+OMP_NUM_THREADS=1 python -m terminal_world.train \
+  --resume runs/tiny/checkpoint.pt \
+  --manifest runs/tiny/manifest.json \
+  --output runs/tiny/checkpoint.pt \
+  --max-windows 2
+```
+
+Keep the manifest and source data unchanged when resuming. `--epochs` sets the total target epoch count; increase it if the saved run has already reached that target.
 
 ## Want to dig deeper?
 
-The detailed documents below are currently in Chinese.
-
 | What you're looking for | Start here |
 | --- | --- |
-| Research questions and design choices | [Model design](terminal-world-model-design.md) |
-| Parameter memory, training loops, and interaction protocol | [Implementation plan](terminal-world-model-implementation.md) |
-| Collecting real terminal trajectories | [Data collection](terminal-data-collection.md) |
-| Training the Qwen base model, resuming, and evaluating | [Full training guide](terminal-world-training-guide.md) |
-| Entry points, Session usage, and validation scope | [Model module guide](terminal_world/README.md) |
+| Model architecture and learning loops | [Model code](terminal_world/model/) |
+| Collecting real terminal trajectories | [Collection script](scripts/collect_terminal_data.py) |
+| Training and checkpoint recovery | [Training entry point](terminal_world/train.py) |
+| Evaluation and online feedback | [Evaluation](terminal_world/evaluate.py) · [Session](terminal_world/session.py) |
+| Tiny and Qwen experiment settings | [Experiment configurations](configs/experiment/) |
+| Correctness checks | [Tests](tests/) |
+
+For command-line options, run `python -m terminal_world.train --help`, `python -m terminal_world.evaluate --help`, or `python scripts/collect_terminal_data.py --help` after installing the relevant dependencies. Data collection uses `requirements-collection.txt`; the CUDA training environment uses `requirements-training-cuda.txt`.
 
 Model code lives in `terminal_world/`, collection tools in `scripts/`, experiment configurations in `configs/experiment/`, and tests in `tests/`.
 
