@@ -50,7 +50,7 @@ training:
   unroll_events: 4
   # 每组批量计算 prefix 的事件数，必须 >= 1；与元梯度窗口大小是不同概念。
   # 可用较小的连续分组控制前段批量计算规模，suffix 始终按事件顺序更新 φ。
-  prefix_batch_size: 1
+  prefix_batch_size: 4
   # 输出 token 预算（使用底座 tokenizer），训练和生成共用，包含 OBS_END。
   # 训练保留 (正文 + OBS_END) 的前 N 个 token；生成最多 N 个或遇 OBS_END 停止。
   max_output_tokens: 2048
