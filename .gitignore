@@ -9,3 +9,7 @@ dist/
 runs/
 .idea/
 wandb/
+# Keep supporting Markdown documents local; publish only the root README.
+*.[mM][dD]
+*.[mM][aA][rR][kK][dD][oO][wW][nN]
+!/README.md
