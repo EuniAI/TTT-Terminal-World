@@ -64,7 +64,9 @@ class Attention(nn.Module):
         def rotate(t):
             return torch.cat((-t[..., d // 2:], t[..., :d // 2]), -1)
         q, k = q * cos + rotate(q) * sin, k * cos + rotate(k) * sin
-        out = causal_attention(q, k, v, c.attention_backend, self.flash_fn)
+        alignment_attention = getattr(self, "_alignment_attention", None)
+        out = (alignment_attention(q, k, v) if alignment_attention is not None
+               else causal_attention(q, k, v, c.attention_backend, self.flash_fn))
         return self.o_proj(out.transpose(1, 2).reshape(b, n, c.hidden_size))
 
 

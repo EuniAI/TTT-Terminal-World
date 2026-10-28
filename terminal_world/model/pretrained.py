@@ -3,7 +3,9 @@
 Architectures/position encodings we have not implemented fail explicitly. Official
 TTT checkpoints require a separate parameter converter and are not treated as Llama.
 """
+from contextlib import contextmanager
 from dataclasses import replace
+import json
 import re
 import torch
 from terminal_world.dataloader.encoding import HFTokenizer, PROTOCOL
@@ -67,28 +69,64 @@ def _import_decoder(reference, options, *, model_type, device):
     return model, fast, config
 
 
-def _alignment_diagnostics(model, fast, probe, actual, expected, tolerance):
-    """Failure-only comparison; never substitute a backend for training."""
-    def summarize(label, result, target):
-        delta = (result - target).abs()
-        mismatches = (~torch.isclose(result, target, atol=tolerance, rtol=tolerance)).sum().item()
-        return (f"{label}: mismatched={mismatches}/{target.numel()}, "
-                f"max_abs={delta.max().item():.6g}, mean_abs={delta.mean().item():.6g}")
+@contextmanager
+def _hf_eager_alignment(model, reference):
+    """Use HF's exact attention kernel only for unpadded import probes."""
+    if reference.config.model_type == "qwen2":
+        from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
+    else:
+        from transformers.models.llama.modeling_llama import eager_attention_forward
+    changed = []
+    try:
+        for layer, source in zip(model.layers, reference.model.layers, strict=True):
+            attention = layer.self_attn
+            previous = getattr(attention, "_alignment_attention", None)
 
-    lines = [summarize("configured adapter vs HF eager", actual, expected)]
-    backend = model.config.attention_backend
-    if backend == "flashbob":
-        try:
-            model.config.attention_backend = "math"
-            with torch.no_grad():
-                baseline = model(probe, fast)[..., :expected.shape[-1]].float().cpu()
-            lines.append(summarize("math adapter vs HF eager", baseline, expected))
-            lines.append(summarize("FlashBoB adapter vs math adapter", actual, baseline))
-        except RuntimeError as error:
-            lines.append(f"math diagnostic failed: {error}")
-        finally:
-            model.config.attention_backend = backend
-    return "\n".join(lines)
+            def eager(q, k, v, source_attention=source.self_attn):
+                mask = torch.full((q.shape[-2], k.shape[-2]), torch.finfo(q.dtype).min,
+                                  dtype=q.dtype, device=q.device).triu(1)
+                output, _ = eager_attention_forward(
+                    source_attention, q, k, v, mask[None, None], scaling=q.shape[-1] ** -0.5, dropout=0.0,
+                )
+                return output.transpose(1, 2)
+
+            changed.append((attention, previous))
+            attention._alignment_attention = eager
+        yield
+    finally:
+        for attention, previous in changed:
+            if previous is None:
+                del attention._alignment_attention
+            else:
+                attention._alignment_attention = previous
+
+
+def _backend_metrics(actual, baseline, ids):
+    """Report drift on original-vocabulary logits, in bounded-memory chunks."""
+    if not torch.isfinite(actual).all() or not torch.isfinite(baseline).all():
+        raise FloatingPointError("non-finite logits during backend comparison")
+    actual, baseline = actual.float(), baseline.float()
+    delta = (actual - baseline).abs()
+    result = {"max_abs": delta.max().item(), "mean_abs": delta.mean().item(),
+              "top1_agreement": (actual.argmax(-1) == baseline.argmax(-1)).float().mean().item()}
+    kl, tv = 0.0, 0.0
+    a, b = actual.flatten(0, -2), baseline.flatten(0, -2)
+    for start in range(0, a.shape[0], 32):
+        log_a = a[start:start + 32].log_softmax(-1)
+        log_b = b[start:start + 32].log_softmax(-1)
+        kl += (log_b.exp() * (log_b - log_a)).sum().item()
+        tv += ((log_b.exp() - log_a.exp()).abs().sum(-1) * 0.5).sum().item()
+    result.update(kl_baseline_to_backend=max(0.0, kl / a.shape[0]),
+                  mean_total_variation=tv / a.shape[0])
+    result.update(nll_baseline=None, nll_backend=None, nll_delta=None)
+    if ids.shape[-1] > 1:
+        targets = ids[..., 1:].cpu().reshape(-1)
+        def nll(logits):
+            return torch.nn.functional.cross_entropy(
+                logits[..., :-1, :].reshape(-1, logits.shape[-1]), targets).item()
+        result.update(nll_baseline=nll(baseline), nll_backend=nll(actual))
+        result["nll_delta"] = result["nll_backend"] - result["nll_baseline"]
+    return result
 
 
 def load_pretrained(options, *, device="cpu"):
@@ -96,7 +134,7 @@ def load_pretrained(options, *, device="cpu"):
         raise ValueError("pretrained revision must be a full commit SHA")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     reference = AutoModelForCausalLM.from_pretrained(
-        options.model_id, revision=options.revision, torch_dtype=options.torch_dtype,
+        options.model_id, revision=options.revision, dtype=options.torch_dtype,
         attn_implementation="eager", trust_remote_code=False,
     ).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(options.model_id, revision=options.revision,
@@ -115,25 +153,38 @@ def load_pretrained(options, *, device="cpu"):
     tolerance = 0.04 if options.dtype in ("bfloat16", "float16") else 2e-5
     # Probe ordinary terminal text at several lengths, without chat templates or protocol IDs.
     # Raw special-token spellings intentionally have different semantics in our encoder.
-    for text in ("pwd\n", "printf 'hello\\n' | cat\nhello\n", "文件.txt\t  error: not found\n"):
+    probes = [("pwd\n", config.max_seq_len),
+              ("printf 'hello\\n' | cat\nhello\n", config.max_seq_len),
+              ("文件.txt\t  error: not found\n", config.max_seq_len),
+              (("$ ls -l\n-rw-r--r-- 1 user user 42 notes.txt\n" * 32), min(128, config.max_seq_len))]
+    for probe_index, (text, limit) in enumerate(probes):
         ids = encoded.encode_text(text)
         if ids != tokenizer.encode(text, add_special_tokens=False):
             raise ValueError("serialized tokenizer changed ordinary-text encoding")
-        probe = torch.tensor([ids[:config.max_seq_len]], dtype=torch.long, device=device)
+        probe = torch.tensor([ids[:limit]], dtype=torch.long, device=device)
         with torch.no_grad():
             expected = reference(probe, use_cache=False).logits.float().cpu()
-            actual = model(probe, fast)[..., :base_vocab].float().cpu()
+            with _hf_eager_alignment(model, reference):
+                actual = model(probe, fast)[..., :base_vocab].float().cpu()
         torch.testing.assert_close(
             actual, expected, atol=tolerance, rtol=tolerance,
             msg=lambda details: (
-                "imported adapter did not preserve base logits\n"
-                f"probe={text!r}, tokens={probe.shape[1]}, dtype={options.dtype}, "
+                "imported adapter did not preserve base logits with matched HF eager attention\n"
+                f"probe_index={probe_index}, tokens={probe.shape[1]}, dtype={options.dtype}, "
                 f"reference_device={next(reference.parameters()).device}, "
                 f"adapter_device={next(model.parameters()).device}, "
                 f"adapter_backend={config.attention_backend}, "
                 f"torch={torch.__version__}, cuda={torch.version.cuda}\n"
-                f"{details}\n"
-                + _alignment_diagnostics(model, fast, probe, actual, expected, tolerance)
+                f"{details}"
             ),
         )
+        print(json.dumps({"event": "pretrained_alignment", "probe": probe_index,
+                          "tokens": probe.shape[1], "attention": "hf_eager", "status": "passed"}), flush=True)
+        with torch.no_grad():
+            configured = model(probe, fast)[..., :base_vocab].float().cpu()
+        metrics = _backend_metrics(configured, actual, probe)
+        print(json.dumps({"event": "pretrained_backend_comparison", "probe": probe_index,
+                          "tokens": probe.shape[1], "baseline": "hf_eager",
+                          "backend": config.attention_backend, "diagnostic_only": True,
+                          **metrics}, allow_nan=False), flush=True)
     return model, fast, encoded, config

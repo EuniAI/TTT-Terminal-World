@@ -7,29 +7,59 @@ from terminal_world.model.transformer import TerminalTransformer
 from terminal_world.config import ModelConfig
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_alignment_diagnostic_restores_backend(fail):
-    from terminal_world.model.pretrained import _alignment_diagnostics
+def test_backend_metrics_distribution_and_next_token_loss():
+    from terminal_world.model.pretrained import _backend_metrics
+    baseline = torch.tensor([[[2., 0.], [0., 2.], [1., 1.]]])
+    ids = torch.tensor([[0, 1, 0]])
+    same = _backend_metrics(baseline, baseline, ids)
+    assert same["kl_baseline_to_backend"] == 0
+    assert same["mean_total_variation"] == 0
+    assert same["top1_agreement"] == 1
+    assert same["nll_delta"] == 0
+    assert same["nll_baseline"] == pytest.approx(torch.log1p(torch.exp(torch.tensor(2.))).item())
+    # A constant logit offset changes raw logits, but not probabilities or loss.
+    shifted = _backend_metrics(baseline + 1, baseline, ids)
+    assert shifted["max_abs"] == 1
+    assert shifted["mean_total_variation"] == pytest.approx(0, abs=1e-7)
+    assert shifted["nll_delta"] == pytest.approx(0, abs=1e-7)
+    changed = _backend_metrics(-baseline, baseline, ids)
+    assert changed["kl_baseline_to_backend"] > 0
+    assert changed["mean_total_variation"] > 0
+    assert changed["nll_delta"] < 0
+    assert _backend_metrics(baseline[:, :1], baseline[:, :1], ids[:, :1])["nll_delta"] is None
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        _backend_metrics(baseline * float("nan"), baseline, ids)
 
-    class DiagnosticModel:
-        config = SimpleNamespace(attention_backend="flashbob")
 
-        def __call__(self, probe, fast):
-            assert self.config.attention_backend == "math"
-            assert not torch.is_grad_enabled()
-            if fail:
-                raise RuntimeError("diagnostic unavailable")
-            return torch.zeros(1, 2, 3)
-
-    model = DiagnosticModel()
-    report = _alignment_diagnostics(model, {}, torch.ones(1, 2, dtype=torch.long),
-                                    torch.ones(1, 2, 3), torch.zeros(1, 2, 3), 0.04)
-    assert model.config.attention_backend == "flashbob"
-    assert "mismatched=6/6" in report
-    if fail:
-        assert "math diagnostic failed: diagnostic unavailable" in report
-    else:
-        assert "math adapter vs HF eager: mismatched=0/6" in report
+@pytest.mark.parametrize("kind", ["llama", "qwen2"])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_matched_attention_alignment_detects_corruption_and_restores(kind, dtype):
+    transformers = pytest.importorskip("transformers")
+    from terminal_world.model.pretrained import _hf_eager_alignment
+    config_cls = transformers.Qwen2Config if kind == "qwen2" else transformers.LlamaConfig
+    model_cls = transformers.Qwen2ForCausalLM if kind == "qwen2" else transformers.LlamaForCausalLM
+    config = config_cls(vocab_size=64, hidden_size=32, intermediate_size=48,
+                        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                        max_position_embeddings=128)
+    config._attn_implementation = "eager"
+    reference = model_cls(config).to(dtype=getattr(torch, dtype)).eval()
+    importer = import_qwen2 if kind == "qwen2" else import_llama
+    model, fast, _ = importer(reference, ModelConfig(dtype=dtype, max_seq_len=128))
+    ids = torch.arange(32).unsqueeze(0)
+    with torch.no_grad():
+        expected = reference(ids, use_cache=False).logits
+        with _hf_eager_alignment(model, reference):
+            actual = model(ids, fast)[..., :64]
+        tolerance = 0.04 if dtype == "bfloat16" else 2e-5
+        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+        assert all(not hasattr(layer.self_attn, "_alignment_attention") for layer in model.layers)
+        with pytest.raises(AssertionError):
+            with _hf_eager_alignment(model, reference):
+                model.lm_head.weight.zero_()
+                corrupted = model(ids, fast)[..., :64]
+                torch.testing.assert_close(corrupted, expected, atol=tolerance, rtol=tolerance)
+        assert all(not hasattr(layer.self_attn, "_alignment_attention") for layer in model.layers)
+        assert model.config.attention_backend == "math"
 
 
 def test_import_mapping_and_old_vocabulary_logits():
@@ -128,7 +158,7 @@ def test_qwen_unsupported_variants_rejected(field, value, match):
         import_qwen2(reference, ModelConfig(max_seq_len=128))
 
 
-def test_qwen_local_load_tokenizer_and_session_roundtrip(tmp_path):
+def test_qwen_local_load_tokenizer_and_session_roundtrip(tmp_path, capsys):
     """Exercise AutoModel dispatch and tokenizer serialization without downloading weights."""
     transformers = pytest.importorskip("transformers")
     tokenizers = pytest.importorskip("tokenizers")
@@ -167,6 +197,16 @@ def test_qwen_local_load_tokenizer_and_session_roundtrip(tmp_path):
     model, fast, encoded, actual = load_pretrained(ModelConfig(
         model_id=str(source), revision="a" * 40, max_seq_len=128,
     ))
+    import json
+    reports = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    alignment = [r for r in reports if r["event"] == "pretrained_alignment"]
+    comparisons = [r for r in reports if r["event"] == "pretrained_backend_comparison"]
+    assert len(alignment) == len(comparisons) == 4
+    assert all(r["status"] == "passed" for r in alignment)
+    assert all(r["diagnostic_only"] and r["backend"] == "math" for r in comparisons)
+    assert comparisons[-1]["tokens"] == 128
+    assert all(r["nll_delta"] is not None for r in comparisons)
+    assert all(not hasattr(layer.self_attn, "_alignment_attention") for layer in model.layers)
     assert actual.qkv_bias and actual.tie_embeddings
     restored = tokenizer_from_state(encoded.state_dict())
     for text in texts:
