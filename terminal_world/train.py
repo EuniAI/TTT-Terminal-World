@@ -17,10 +17,41 @@ from terminal_world.tracking import start_tracker
 from terminal_world.schedule import make_schedule, outer_learning_rate
 
 
+def start_new_stage(state, previous, stream):
+    """Explicit data transition at a completed stage boundary; preserve weights/AdamW."""
+    old_stream = EventStream(previous["manifest"])
+    if old_stream.digest != previous["manifest_digest"]:
+        raise ValueError("source checkpoint data manifest mismatch")
+    if old_stream.digest == stream.digest:
+        raise ValueError("new stage requires a different manifest; use --resume for the same stage")
+    at_epoch_end = (state.next_cursor == old_stream.total_events or
+                    (state.epoch > 0 and state.next_cursor == 0))
+    if not old_stream.total_events or state.is_open or not at_epoch_end or state.windows_completed == 0:
+        raise ValueError("finish the source stage before starting a new stage")
+    old_plan = previous.get("extra", {}).get("outer_lr_plan")
+    if old_plan and state.windows_completed < old_plan.get("start_window", 0) + old_plan["total_windows"]:
+        raise ValueError("finish the source stage learning-rate plan before starting a new stage")
+    old_test = EventStream(previous["manifest"], "test", verify=False)
+    new_test = EventStream(stream.manifest, "test", verify=False)
+    hashes = lambda entries: {entry["content_hash"] for entry in entries}
+    if (hashes(stream.entries) & hashes(old_test.entries) or
+            hashes(old_stream.entries) & hashes(new_test.entries)):
+        raise ValueError("training/test trajectory overlap across stages")
+    source = {"manifest_digest": old_stream.digest, "epoch": state.epoch,
+              "cursor": state.next_cursor, "windows_completed": state.windows_completed,
+              "outer_lr_plan": old_plan, "wandb": previous.get("extra", {}).get("wandb")}
+    state.epoch = 0
+    state.next_cursor = 0
+    return source
+
+
 def run(args):
     if args.epochs < 1 or (args.max_windows is not None and args.max_windows < 1):
         raise ValueError("epochs and max-windows must be positive")
     output = Path(args.output)
+    stage_from = getattr(args, "start_stage_from", None)
+    if stage_from and args.resume:
+        raise ValueError("--resume and --start-stage-from are mutually exclusive")
     if not args.resume and output.exists():
         raise FileExistsError("output checkpoint already exists; use --resume or a new output")
     manifest = json.loads(Path(args.manifest).read_text())
@@ -28,12 +59,18 @@ def run(args):
     if not stream.total_events:
         raise ValueError("training split is empty")
     previous = {}
-    if args.resume:
+    stage_source = None
+    if args.resume or stage_from:
         model, state, optimizer, config, encoder, previous = load_checkpoint(
-            args.resume, device=args.device, expected_manifest_digest=stream.digest)
+            args.resume or stage_from, device=args.device,
+            expected_manifest_digest=stream.digest if args.resume else None)
         if args.config and RunConfig.load(args.config).to_dict() != config.to_dict():
             raise ValueError("resume config mismatch; use the checkpoint's configuration")
         coverage = previous.get("extra", {}).get("boundary_coverage", {"triples": 0, "covered": 0, "tail": []})
+        if stage_from:
+            stage_source = start_new_stage(state, previous, stream)
+            stage_source["checkpoint"] = str(Path(stage_from).resolve())
+            coverage = {"triples": 0, "covered": 0, "tail": []}
     else:
         if not args.config:
             raise ValueError("fresh training requires --config")
@@ -60,9 +97,15 @@ def run(args):
                   "backend": config.model.attention_backend, "device": args.device}
     print(json.dumps(model_info), flush=True)
     extra = dict(previous.get("extra", {}))
+    if stage_source is not None:
+        extra["stage_history"] = [*extra.get("stage_history", []), stage_source]
+        extra.pop("wandb", None)  # A new data stage owns a new logging run.
+        extra.pop("outer_lr_plan", None)
     if not args.resume:
         plan = make_schedule(config.training, stream.total_events, args.epochs)
         if plan is not None:
+            if stage_from:
+                plan["start_window"] = state.windows_completed
             extra["outer_lr_plan"] = plan
     plan = extra.get("outer_lr_plan")
     # Fail before writing a checkpoint if a scheduled resume lost its horizon.
@@ -142,9 +185,11 @@ def main():
     parser.add_argument("--config")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--resume")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--resume", help="resume the same data stage and schedule")
+    source.add_argument("--start-stage-from", help="start a new data stage from a completed training checkpoint; preserve weights and AdamW, restart the LR schedule")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--epochs", type=int, default=1, help="total target epochs, including completed epochs")
+    parser.add_argument("--epochs", type=int, default=1, help="total target epochs within this stage, including completed epochs")
     parser.add_argument("--max-windows", type=int, help="stop after this many additional windows")
     parser.add_argument("--wandb-project", help="enable online W&B tracking in this project")
     parser.add_argument("--wandb-entity", help="W&B user or team")

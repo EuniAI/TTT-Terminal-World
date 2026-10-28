@@ -91,3 +91,33 @@ def test_generation_metrics_and_frozen_training_copy(tiny):
     assert result["body_truncated"]["exact_with_end_rate"] is None
     assert all(p.requires_grad for p in model.parameters())
     assert all(torch.equal(fast[k], original[k]) for k in fast)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_evaluation_cli_reads_test_split(tmp_path, tiny, monkeypatch, capsys, legacy):
+    import json
+    from terminal_world.dataloader.trajectory import build_file_split_manifest, EventStream
+    from terminal_world.evaluate import main
+    model, fast, encoder, config = tiny
+    paths = [tmp_path / name for name in ("training.jsonl", "test.jsonl")]
+    for path, command in zip(paths, ("x", "y")):
+        path.write_text(json.dumps({"trajectory": [{"command": command, "output": "a"}]}) + "\n")
+    manifest = build_file_split_manifest(paths[:1], paths[1:])
+    if legacy:
+        for entry in manifest["entries"]:
+            entry["split"] = {"training": "train", "test": "validation"}[entry["split"]]
+    stream = EventStream(manifest)
+    checkpoint = tmp_path / "checkpoint.pt"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.outer_lr)
+    save_checkpoint(checkpoint, model, TrainingState(fast), optimizer, config,
+                    encoder.tokenizer, manifest, stream.digest)
+    before = checkpoint.read_bytes()
+    monkeypatch.setattr("sys.argv", ["evaluate", "--checkpoint", str(checkpoint),
+                                    "--frozen", "--exposure-label", "test"])
+    main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["test_manifest"] == stream.digest
+    assert result["shell"]["events"] == 1
+    assert checkpoint.read_bytes() == before
+    # The same legacy digest remains valid for training resume.
+    load_checkpoint(checkpoint, expected_manifest_digest=stream.digest)

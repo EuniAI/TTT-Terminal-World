@@ -63,10 +63,11 @@ python -m pip install -e '.[test]'
 # Check the implementation
 python -m pytest -q
 
-# Build a manifest and train / validation split from the included trajectories
+# Index the existing training / test files without resampling
 mkdir -p runs/tiny
 python -m terminal_world.dataloader.trajectory \
-  terminal_trajs_llm.jsonl \
+  --training-files terminal_trajs_llm_train.jsonl \
+  --test-files terminal_trajs_llm_test.jsonl \
   --output runs/tiny/manifest.json
 
 # Run two training windows
@@ -96,6 +97,19 @@ Keep the manifest and source data unchanged when resuming. `--epochs` sets the t
 The schedule length is fixed at the first launch: `ceil(training events / unroll_events) × epochs`, including each epoch's partial final window. Set `--epochs` to the intended total even for a short `--max-windows` trial. The checkpoint saves the schedule plan and completed window count, so resuming does not restart warmup. Extending beyond the original plan keeps the learning rate at `1e-5`.
 
 Scheduled runs need at least three planned windows; for very short runs, warmup is capped to leave a peak and final decay step. The tiny configuration and older checkpoints retain their constant learning rate. Both learning rates are included in the training logs.
+
+## Training in two stages
+
+The intended experiment order is:
+
+1. Train on `terminal_trajs_llm_train.jsonl`, then evaluate `terminal_trajs_llm_test.jsonl`.
+2. Continue training on `terminal_trajs_glm_medium_train.jsonl`, then evaluate the GLM medium and LLM test sets separately.
+
+Create one manifest per dataset using `--training-files` and `--test-files`. To switch stages, use `python -m terminal_world.train --start-stage-from <completed-stage-checkpoint> --manifest <next-stage-manifest> --output <new-checkpoint> --device cuda --epochs 1`. This preserves model weights, fast weights, AdamW state, and random state, starts the new dataset at its beginning, and restarts warmup and cosine decay for the new stage. The cumulative window count is preserved. Each stage's `--epochs` sets its own schedule horizon.
+
+Use `--resume` for interruptions within a stage. Stage transitions require a completed source epoch and learning-rate plan, validate the source data, and reject cross-stage training/test trajectory overlap. A new stage must write to a new checkpoint path and gets a separate W&B run if tracking is enabled.
+
+For each test, pass its manifest with `python -m terminal_world.evaluate --checkpoint <checkpoint> --manifest <dataset-manifest> --device cuda --exposure-label <label>`. Evaluation reads only the `test` split and adapts an in-memory copy. Stage two starts from the stage-one training checkpoint; test-time updates never enter subsequent training. Run the two final tests in separate invocations from the same stage-two checkpoint, and use `--frozen` for a comparison without adaptation.
 
 ## Want to dig deeper?
 

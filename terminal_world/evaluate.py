@@ -47,9 +47,9 @@ def main():
     model, state, _, config, encoder, data = load_checkpoint(args.checkpoint, device=args.device,
                                                             training=False, restore_rng=False)
     manifest = json.loads(Path(args.manifest).read_text()) if args.manifest else data["manifest"]
-    stream = EventStream(manifest, "validation")
+    stream = EventStream(manifest, "test")
     if not stream.total_events:
-        raise ValueError("validation split is empty")
+        raise ValueError("test split is empty")
     # The checkpoint may be mid-training-trajectory. End that context explicitly in the copy.
     events = stream.from_cursor()
     if state.is_open:
@@ -59,7 +59,7 @@ def main():
                          clip_norm=config.training.inner_clip_norm, adapt=not args.frozen,
                          is_open=state.is_open, generate=args.generate)
     result.update(exposure_label=args.exposure_label, adaptation=not args.frozen,
-                  source_cursor=state.next_cursor, validation_manifest=stream.digest)
+                  source_cursor=state.next_cursor, test_manifest=stream.digest)
     print(json.dumps(result))
 
 

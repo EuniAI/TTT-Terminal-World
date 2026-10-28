@@ -24,6 +24,10 @@ def outer_learning_rate(config, completed, plan):
         raise ValueError("invalid outer_lr_plan")
     if completed < 0:
         raise ValueError("completed windows must be nonnegative")
+    start = plan.get("start_window", 0)
+    if type(start) is not int or not 0 <= start <= completed:
+        raise ValueError("invalid outer_lr_plan start_window")
+    completed -= start
     if warmup and completed < warmup:
         return config.outer_lr * completed / warmup
     progress = min(1.0, (completed - warmup) / (total - 1 - warmup))
