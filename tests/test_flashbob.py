@@ -16,13 +16,15 @@ def test_flashbob_does_not_silently_fall_back(tiny):
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-@pytest.mark.parametrize("kv_heads", [1, 2])
-def test_flashbob_operator_and_window(kv_heads):
+@pytest.mark.parametrize("heads,kv_heads,head_dim,qkv_bias", [
+    (2, 1, 32, False), (2, 2, 32, False), (16, 2, 128, True),
+], ids=["gqa", "mha", "qwen2-3b-heads"])
+def test_flashbob_operator_and_window(heads, kv_heads, head_dim, qkv_bias):
     # BF16 acceptance tolerances: 3% activations, 10% derivatives plus small absolute floor.
     # This test intentionally fails rather than skipping unsupported software on a CUDA host.
-    fn = validate_flashbob("cuda", torch.bfloat16, 32, 2, kv_heads)
-    q = torch.randn(1, 2, 17, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(1, kv_heads, 17, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    fn = validate_flashbob("cuda", torch.bfloat16, head_dim, heads, kv_heads)
+    q = torch.randn(1, heads, 17, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, kv_heads, 17, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
     results = []
     probe = torch.randn_like(q)
@@ -36,8 +38,9 @@ def test_flashbob_operator_and_window(kv_heads):
     for a, b in zip(results[0][1] + results[0][2], results[1][1] + results[1][2]):
         torch.testing.assert_close(a, b, atol=0.08, rtol=0.1)
 
-    config = ModelConfig(hidden_size=64, intermediate_size=96, num_heads=2, num_kv_heads=kv_heads,
-                         dtype="bfloat16", max_seq_len=128)
+    # Match Qwen head geometry, not full 36-layer/11008-wide model memory requirements.
+    config = ModelConfig(hidden_size=heads * head_dim, intermediate_size=96, num_heads=heads,
+                         num_kv_heads=kv_heads, qkv_bias=qkv_bias, dtype="bfloat16", max_seq_len=128)
     math_model, math_fast = create_model(config, "cuda")
     flash_model, flash_fast = create_model(replace(config, attention_backend="flashbob"), "cuda")
     flash_model.load_state_dict(math_model.state_dict())

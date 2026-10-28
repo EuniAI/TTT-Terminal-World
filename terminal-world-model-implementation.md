@@ -30,7 +30,7 @@
 - `open` / `close` 为模型协议事件，不交给 Docker；各执行一次内循环更新，不重置权重。
 - fast weights 只在模型首次创建时初始化一次。换轨迹、环境、batch、epoch、窗口或重启均沿用已有状态。
 - 训练只有元训练阶段；窗口内保留穿过更新的二阶梯度，窗口间显式截断计算图。评估和部署关闭外循环。
-- 正式模型约 1B 参数，微型模型仅用于正确性验证。所有离线训练和评估都读取真实 output，不重新执行数据命令。
+- 正式底座选用 Qwen2.5-Coder-3B Base，新增适应分支后整体约 3.70B；微型模型仅用于正确性验证。所有离线训练和评估都读取真实 output，不重新执行数据命令。
 
 ## 2. 代码结构与职责
 
@@ -163,7 +163,7 @@ command 不截断。完整 prompt 加配置输出预算超过模型容量时显�
 
 首次接入普通预训练底座时，需要为新增适应 MLP 定义一次性初始化。建议保留原 attention、普通 MLP 和规范化路径；新增适应残差支路的输入/门控投影正常初始化，输出投影置零，使支路初始为恒等残差。不能把所有投影都置零。新增规范化层属于 θ，具体位置按底座与上游结构核对，并用旧词表 logits 的前后对比验证接入效果。
 
-这是从普通底座接入的工程方案，不是对上游训练结果的复现。若采用官方 TTT checkpoint，则加载其现有双 MLP 及参数映射，不再次添加支路。具体底座尚未确定；接入后分别报告总参数和 φ 参数量，正式总规模保持约 1B。
+这是从普通底座接入的工程方案，不是对上游训练结果的复现。若采用官方 TTT checkpoint，则加载其现有双 MLP 及参数映射，不再次添加支路。当前选定 Qwen2.5-Coder-3B Base，末 9/36 层适应；接入后分别报告 θ 和 φ 参数量，新增分支后总规模约 3.70B。
 
 ### 4.2 PyTorch 函数式调用
 
@@ -394,23 +394,31 @@ session.control("close")
 | 2. 微型模型 | θ/φ 分离、prefix/suffix 切分、step_loss | 参数及存储不重叠，生成不读目标，future token 不影响当前 logits，事件间 attention 隔离 |
 | 3. 内外循环 | prefix batch、顺序 suffix、函数式 SGD 和窗口外循环 | 与全串行路径比较损失、最终 φ 及 θ 元梯度；有限差分检查，切图不改 φ 数值 |
 | 4. 会话与恢复 | predict/observe/control、完整 checkpoint | 更新恰好一次，恢复不重复边界；连续运行与保存恢复后的预测、参数和游标一致 |
-| 5. 约 1B 底座 | 双 MLP 接入、参数映射、长度配置、FlashBoB adapter | 一次性初始化检查、FlashBoB/math 完整窗口梯度对比、峰值显存与耗时、有限数值 |
+| 5. 约 3B 底座 | 双 MLP 接入、参数映射、长度配置、FlashBoB adapter | 一次性初始化检查、FlashBoB/math 完整窗口梯度对比、峰值显存与耗时、有限数值 |
 | 6. 小规模元训练 | 少量真实轨迹上的完整闭环 | 任务/边界指标分离，跨边界窗口覆盖，长期 φ 连续性与验证副本隔离 |
 
 微型梯度测试至少用两个真实事件与控制边界构造非零元梯度路径；只测试单步 loss 下降不足以证明元学习实现正确。验收还应覆盖正文长度 0、N−1、N、N+1，以及窗口恰好切在 open/close 前后的情况。
 
 前段批量优化另需验证：在相同初始 θ/φ、关闭 dropout、相同输入和精度下，比较逐事件有效位置 logits、每步损失、最终 fast weights，以及 prefix/suffix 两部分 θ 的外循环梯度，允许声明过的浮点误差。用不同长度事件、空输出和 open/close 覆盖 padding；修改后一个事件不能影响较早事件的预测和更新。分别测试 `prefix_batch_size=1`、中间值和整窗口，确保计算分批不改变适应顺序。性能记录整窗口耗时和峰值显存，不只测 prefix 前向。
 
-先完成微型模型上的算法验证，再选正式底座和硬件预算。尚待落定的配置是 `model_id/revision`、适应层数、一次性初始化细节、inner/outer 学习率、裁剪策略、`unroll_events`、`prefix_batch_size` 和训练精度；`max_output_tokens` 默认 2048。关键配置未填写时启动失败，不猜测模型、学习率或重置策略。
+微型模型算法验证后，当前已固定 Qwen2.5-Coder-3B Base 的 `model_id/revision`、末 9 层适应和 BF16 精度。实验配置提供显式的 inner/outer 学习率、裁剪策略、`unroll_events` 和 `prefix_batch_size` 起步值，尚需 GPU 验证和调优；`max_output_tokens` 为 2048。关键配置未填写时仍启动失败，不隐式回退或重置记忆。
 
 ### 8.1 当前代码交付与验收边界
 
 - 已实现：manifest 摘要和去重划分、原序事件流、open/close 协议、输出编码；前段 batch + 后段顺序 SGD；AdamW 外循环；跨窗口/轨迹/epoch 保留 φ；独立评估副本与 frozen 消融；在线 Session；原子检查点和严格恢复。
 - 已验证 CPU math 路径：右侧 padding/因果隔离；串行与批量的 logits、损失、最终 φ、θ 元梯度一致；有限差分；保存恢复与连续训练完全一致，包括跨 epoch；生成不更新记忆；非有限窗口不提交。现有采集数据的两条完整轨迹另用于小规模运行检查，原始数据未修改。
 - FlashBoB 已接入并固定 commit 为 `f2bd4a38a9b65bae455ef4336d7b54f0acd3caca`，e2e 参考 revision 为 `8a2d685c080d895a4b138eb6b5ff69a840e40968`。CUDA 测试与完整窗口 benchmark 已提供；本机无 CUDA、PyTorch 为 2.13.0，**未执行 FlashBoB GPU 数值或性能验收**。
-- 普通预训练模型导入目前仅支持无 bias、SwiGLU、未缩放 RoPE 的 Llama；其他架构、scaled RoPE 和官方 e2e checkpoint 显式拒绝。导入入口会比较原词表 logits，但本机缺少 transformers/真实底座，尚未完成真实预训练权重验证。正式模型 ID/revision 和硬件预算仍由实验配置明确指定。
+- 普通预训练模型导入支持无 bias 的 Llama 和保留 QKV bias 的 Qwen2，均限于 SwiGLU、未缩放 RoPE、full causal attention；其他架构、滑动窗口、scaled RoPE 和官方 e2e checkpoint 显式拒绝。导入入口会比较原词表 logits，但本机缺少 transformers/真实底座，尚未完成真实预训练权重验证。正式模型 ID/revision 和硬件预算仍由实验配置明确指定。
 - 在线生成暂为贪心全前缀重算，无 KV cache；这是正确但较慢的首版实现。窗口内前段特征不用于未知未来生成。端到端恰好一次执行仍由外部调度器承担。
 
 本次本地验收：新增测试 **23 passed / 3 skipped**（2 项 CUDA、1 项真实 transformers 对比）；原有采集测试 **44 passed / 5 skipped**。另用 `terminal_trajs_llm.jsonl` 前两条完整轨迹的临时副本运行 **32 个事件、8 个训练窗口**，在第 2 窗口保存后恢复至完成，并执行隔离副本评估；跨边界 triple 在同一窗口内覆盖 1 次。该运行只验证训练闭环，不是泛化评估或正式吞吐实验。
 
 实际运行和测试命令见 [terminal_world/README.md](terminal_world/README.md)。采集器不需要为训练改写；上述测试结论仅覆盖已执行的路径，不表示约 1B 模型已训练或 FlashBoB 已获得加速。
+
+### Qwen2.5-Coder-3B 接入更新
+
+正式配置已选定 `Qwen/Qwen2.5-Coder-3B` Base，revision 固定为 `09d9bc5d376b0cfa0100a0694ea7de7232525803`。底座 36 层中最后 9 层增加 prime MLP，适应层占比 25%；φ 共 608,698,368 参数，改造后整体约 3.70B。原有 QKV bias、共享 embedding、GQA、RoPE 和普通 MLP 均保留；`qkv_bias` 随配置保存恢复，内外循环生命周期不变。配置中的学习率和窗口长度仅为实验起点。
+
+新增 Qwen2 严格权重导入、非零 bias 测试、官方微型 Qwen2 logits 对齐测试、tokenizer/Session 往返测试，以及带 bias 的元梯度和恢复验证。真实 3B 权重导入及 FlashBoB GPU 数值/性能尚未验收；具体运行方式与环境限制见 `terminal_world/README.md`。前面的本地验收数字为历史记录，不代表本次新增路径全部执行。
+
+此次本地测试：`python3 -m pytest -q` 为 **41 passed / 6 skipped**。跳过项为 3 个 CUDA 测试和 3 个依赖 Transformers/tokenizers 的测试；当前环境缺少这些可选依赖且安装尝试未成功。已执行的是 CPU math、非零 bias 映射、带/不带 bias 的元梯度与恢复验证，不是官方真实 3B 权重的验收。

@@ -23,10 +23,14 @@ class ModelConfig:
     attention_backend: str = "math"
     dtype: str = "float32"
     tie_embeddings: bool = False
+    # Qwen2 uses bias on Q/K/V only; keep False for existing Llama/tiny checkpoints.
+    qkv_bias: bool = False
     model_id: str = "tiny-random"
     revision: str = "native-v1"
 
     def validate(self):
+        if not isinstance(self.qkv_bias, bool):
+            raise ValueError("qkv_bias must be a boolean")
         missing = [k for k, v in asdict(self).items() if v is None]
         if missing:
             raise ValueError(f"model configuration is incomplete: {missing}")

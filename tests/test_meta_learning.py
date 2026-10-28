@@ -50,7 +50,8 @@ def test_meta_gradient_finite_difference_and_inner_path(tiny):
     model, fast, encoder, _ = tiny
     steps = sample_steps(encoder)
     loss, _, _ = loss_for_window(model, fast, steps, alpha=0.2, prefix_batch_size=3)
-    parameter = model.layers[0].self_attn.q_proj.weight
+    projection = model.layers[0].self_attn.q_proj
+    parameter = projection.bias if model.config.qkv_bias else projection.weight
     gradient = torch.autograd.grad(loss, parameter)[0]
     direction = torch.randn_like(parameter)
     direction /= direction.norm()

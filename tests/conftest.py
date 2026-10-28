@@ -11,10 +11,10 @@ def deterministic_cpu():
     torch.manual_seed(123)
 
 
-@pytest.fixture
-def tiny():
+@pytest.fixture(params=[False, True], ids=["llama", "qwen2-bias"])
+def tiny(request):
     config = RunConfig(ModelConfig(hidden_size=8, intermediate_size=12, num_heads=2, num_kv_heads=1,
-                                   max_seq_len=128, dtype="float64"),
+                                   max_seq_len=128, dtype="float64", qkv_bias=request.param),
                        TrainConfig(inner_lr=0.2, outer_lr=0.001, unroll_events=4, prefix_batch_size=4, max_output_tokens=8))
     model, fast = create_model(config.model)
     encoder = Encoder(ByteTokenizer(), 8, 128)

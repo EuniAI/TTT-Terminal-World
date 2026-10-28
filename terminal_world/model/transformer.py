@@ -43,9 +43,9 @@ class Attention(nn.Module):
         super().__init__()
         self.config = config
         h, d = config.hidden_size, config.hidden_size // config.num_heads
-        self.q_proj = nn.Linear(h, config.num_heads * d, False)
-        self.k_proj = nn.Linear(h, config.num_kv_heads * d, False)
-        self.v_proj = nn.Linear(h, config.num_kv_heads * d, False)
+        self.q_proj = nn.Linear(h, config.num_heads * d, bias=config.qkv_bias)
+        self.k_proj = nn.Linear(h, config.num_kv_heads * d, bias=config.qkv_bias)
+        self.v_proj = nn.Linear(h, config.num_kv_heads * d, bias=config.qkv_bias)
         self.o_proj = nn.Linear(h, h, False)
         self.flash_fn = None
 
