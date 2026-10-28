@@ -36,7 +36,7 @@ model:
   dtype: bfloat16
 training:
   # 内循环无动量 SGD 学习率：每个事件更新一次 φ；起步值，需实验调优。
-  inner_lr: 0.01
+  inner_lr: 0.10
   # 外循环 AdamW 学习率：每个窗口更新一次 θ；起步值，需实验调优。
   outer_lr: 0.00001
   # 每个元梯度窗口的事件数（含 open/close），必须 >= 2；尾窗口可不足此长度。
@@ -49,9 +49,9 @@ training:
   # 输出 token 预算（使用底座 tokenizer），训练和生成共用，包含 OBS_END。
   # 训练保留 (正文 + OBS_END) 的前 N 个 token；生成最多 N 个或遇 OBS_END 停止。
   max_output_tokens: 2048
-  # 可选的内循环全局梯度范数裁剪：null 为关闭，正数为阈值。
+  # 内循环全局梯度范数裁剪：阈值 1.0；所有 fast weights 的梯度共同计算范数。
   # 裁剪可微，并在训练、评估、在线适应中使用相同配置。
-  inner_clip_norm: null
+  inner_clip_norm: 1.0
   # AdamW 对 θ 的权重衰减，0 为关闭；内循环 φ 不应用权重衰减。
   outer_weight_decay: 0.0
   # 首次运行的 Python/PyTorch 随机种子；续训恢复检查点中的随机状态。
