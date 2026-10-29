@@ -4,6 +4,7 @@ import os
 import platform
 import random
 import tempfile
+import uuid
 from pathlib import Path
 import torch
 from terminal_world.config import RunConfig, E2E_REVISION, FLASHBOB_REVISION
@@ -45,7 +46,42 @@ def atomic_save(payload, path):
             os.unlink(temp)
 
 
-def save_checkpoint(path, model, state, optimizer, config, tokenizer, manifest, manifest_digest, *, mode="train", extra=None):
+def retained_atomic_save(payload, path, *, keep=3):
+    """Keep recent window snapshots; the public path is a hard link to the latest.
+
+    Publish before pruning so a failed write never removes the last good checkpoint.
+    Re-saving a window replaces that snapshot rather than consuming a history slot.
+    """
+    if keep < 1:
+        raise ValueError("checkpoint retention must be positive")
+    path = Path(path)
+    history = path.parent / (path.stem + ".checkpoints")
+    snapshot = history / f"window-{payload['windows_completed']:012d}.pt"
+    atomic_save(payload, snapshot)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.link"
+    try:
+        os.link(snapshot, temporary)
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    # Sort by save time, not window number, so resuming an older snapshot is supported.
+    candidates = [p for p in history.iterdir()
+                  if p.name.startswith("window-") and p.suffix == ".pt"
+                  and p.stem.removeprefix("window-").isdigit()]
+    older = sorted((p for p in candidates if p != snapshot),
+                   key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    for obsolete in older[keep - 1:]:
+        obsolete.unlink()
+
+
+def save_checkpoint(path, model, state, optimizer, config, tokenizer, manifest, manifest_digest, *, mode="train", extra=None,
+                    keep=1):
     model.validate_fast(state.fast_weights)
     ensure_finite(model.parameters(), "checkpoint theta")
     ensure_finite(state.fast_weights.values(), "checkpoint phi")
@@ -61,7 +97,10 @@ def save_checkpoint(path, model, state, optimizer, config, tokenizer, manifest, 
                "rng": {"python": random.getstate(), "torch": torch.get_rng_state(),
                        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []},
                "extra": extra or {}}
-    atomic_save(payload, path)
+    if keep > 1:
+        retained_atomic_save(payload, path, keep=keep)
+    else:
+        atomic_save(payload, path)
 
 
 def load_checkpoint(path, *, device="cpu", expected_manifest_digest=None, training=True, restore_rng=True):

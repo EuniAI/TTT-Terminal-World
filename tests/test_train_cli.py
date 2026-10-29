@@ -51,3 +51,60 @@ def test_cli_resume_across_epochs(tmp_path, tiny, capsys, schedule, pause_after)
         run(extended)
         logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
         assert rates(logs) == [tiny[3].training.outer_end_lr]
+
+
+@pytest.mark.parametrize("limit", [None, 51])
+def test_checkpoint_every_50_and_final_save(tmp_path, tiny, monkeypatch, limit):
+    import terminal_world.train as training
+    tiny[3].training.unroll_events = 2
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.safe_dump(tiny[3].to_dict()))
+    data = tmp_path / "data.jsonl"
+    data.write_text('\n'.join(json.dumps({"trajectory": [{"command": str(i), "output": "a"}]})
+                              for i in range(34)) + '\n')
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(build_manifest([data], 0)))
+    output = tmp_path / "run.pt"
+    saves = []
+    original = training.save_checkpoint
+    def save(path, model, state, *args, **kwargs):
+        saves.append((state.windows_completed, state.epoch))
+        return original(path, model, state, *args, **kwargs)
+    monkeypatch.setattr(training, "save_checkpoint", save)
+    run(Namespace(config=str(cfg), manifest=str(manifest), output=str(output), resume=None,
+                  device="cpu", epochs=1, max_windows=limit))
+    assert saves == [(0, 0), (50, 0), (51, 1 if limit is None else 0)]
+    saved = torch.load(output, weights_only=False)
+    assert saved["windows_completed"] == 51
+
+
+@pytest.mark.parametrize("stop", ["SIGTERM", "SIGINT", "error"])
+def test_stop_saves_only_completed_safe_windows(tmp_path, tiny, monkeypatch, stop):
+    import signal
+    import terminal_world.train as training
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.safe_dump(tiny[3].to_dict()))
+    data = tmp_path / "data.jsonl"
+    data.write_text(json.dumps({"trajectory": [{"command": "x", "output": "a"}]}) + '\n')
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(build_manifest([data], 0)))
+    output = tmp_path / "run.pt"
+    original = training.train_window
+    handlers = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    def train(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if stop == "error":
+            raise RuntimeError("unsafe update")
+        signal.raise_signal(getattr(signal, stop))
+        return result
+    monkeypatch.setattr(training, "train_window", train)
+    args = Namespace(config=str(cfg), manifest=str(manifest), output=str(output), resume=None,
+                     device="cpu", epochs=1, max_windows=None)
+    if stop == "error":
+        with pytest.raises(RuntimeError, match="unsafe update"):
+            run(args)
+    else:
+        run(args)
+    saved = torch.load(output, weights_only=False)
+    assert saved["windows_completed"] == (0 if stop == "error" else 1)
+    assert all(signal.getsignal(s) == handler for s, handler in handlers.items())

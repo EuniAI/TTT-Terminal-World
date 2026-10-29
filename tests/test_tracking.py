@@ -109,10 +109,12 @@ def test_log_failure_leaves_committed_checkpoint(tmp_path, tiny, sdk, monkeypatc
     from terminal_world.tracking import Tracker
     def fail(self, metrics):
         saved = torch.load(output, weights_only=False)
-        assert saved["windows_completed"] == metrics["windows"] == 1
+        assert saved["windows_completed"] == 0
+        assert metrics["windows"] == 1
         raise RuntimeError("logging failed")
     monkeypatch.setattr(Tracker, "log", fail)
     with pytest.raises(RuntimeError, match="logging failed"):
         run(Namespace(config=str(cfg), manifest=str(manifest), output=str(output), resume=None,
                       device="cpu", epochs=1, max_windows=None, wandb_project="p"))
     assert sdk[-1].finishes == [{"exit_code": 1}]
+    assert torch.load(output, weights_only=False)["windows_completed"] == 1

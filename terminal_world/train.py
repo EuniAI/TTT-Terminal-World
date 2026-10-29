@@ -1,5 +1,7 @@
 """python -m terminal_world.train --config ... --manifest ... --output ..."""
 import argparse
+from contextlib import contextmanager
+import signal
 import json
 from pathlib import Path
 import random
@@ -45,9 +47,25 @@ def start_new_stage(state, previous, stream):
     return source
 
 
+@contextmanager
+def _stop_requests():
+    # Finish the current window before saving: never persist a partial optimizer update.
+    requested = []
+    def request_stop(signum, frame):
+        requested.append(signum)
+    previous = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield requested
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def run(args):
     if args.epochs < 1 or (args.max_windows is not None and args.max_windows < 1):
         raise ValueError("epochs and max-windows must be positive")
+    if getattr(args, "save_every_windows", 50) < 1:
+        raise ValueError("save-every-windows must be positive")
     output = Path(args.output)
     stage_from = getattr(args, "start_stage_from", None)
     if stage_from and args.resume:
@@ -116,17 +134,23 @@ def run(args):
         def commit():
             extra["boundary_coverage"] = coverage
             save_checkpoint(output, model, state, optimizer, config, encoder.tokenizer,
-                            manifest, stream.digest, extra=extra)
+                            manifest, stream.digest, extra=extra, keep=3)
         # Save identity before the first window, including when enabling logging on an old run.
         commit()
-        _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker, plan)
+        with _stop_requests() as stop_requested:
+            _train_windows(args, model, state, optimizer, config, encoder, stream, coverage,
+                           commit, tracker, plan, stop_requested)
 
 
-def _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker, plan=None):
+def _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker, plan=None, stop_requested=None):
     completed = 0
+    interval = getattr(args, "save_every_windows", 50)
     while state.epoch < args.epochs:
         for window in windows(stream.from_cursor(state.next_cursor), encoder, config.training.unroll_events,
                               start_open=state.is_open):
+            if stop_requested:
+                commit()
+                return
             cuda_timing = tracker.enabled and next(model.parameters()).device.type == "cuda"
             if cuda_timing:
                 torch.cuda.synchronize(next(model.parameters()).device)
@@ -146,10 +170,14 @@ def _train_windows(args, model, state, optimizer, config, encoder, stream, cover
                     coverage["triples"] += 1
                     coverage["covered"] += int(len({t[1] for t in joined[i:i + 3]}) == 1)
             coverage["tail"] = joined[-2:]
-            # Checkpoint every committed window; no shell command is ever executed here.
-            checkpoint_started = time.perf_counter()
-            commit()
-            checkpoint_seconds = time.perf_counter() - checkpoint_started
+            completed += 1
+            limit_reached = args.max_windows is not None and completed >= args.max_windows
+            checkpoint_seconds = 0.0
+            saved = state.windows_completed % interval == 0 or limit_reached or bool(stop_requested)
+            if saved:
+                checkpoint_started = time.perf_counter()
+                commit()
+                checkpoint_seconds = time.perf_counter() - checkpoint_started
             metrics = summarize(records)
             metrics.update(loss=loss, epoch=state.epoch, cursor=state.next_cursor,
                            windows=state.windows_completed, boundary_coverage=coverage,
@@ -158,6 +186,7 @@ def _train_windows(args, model, state, optimizer, config, encoder, stream, cover
                 metrics["performance"] = {
                     "window_compute_seconds": compute_seconds,
                     "checkpoint_seconds": checkpoint_seconds,
+                    "checkpoint_saved": int(saved),
                     "target_tokens_per_second": sum(r["tokens"] for r in records) / compute_seconds,
                 }
                 triples = coverage["triples"]
@@ -165,11 +194,18 @@ def _train_windows(args, model, state, optimizer, config, encoder, stream, cover
                 metrics["boundary_coverage"]["rate"] = coverage["covered"] / triples if triples else None
                 if cuda_timing:
                     metrics["performance"]["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(next(model.parameters()).device)
-                # Log only committed windows; an SDK failure leaves the checkpoint recoverable.
-                tracker.log(metrics)
+                # Log every completed window; disk recovery follows the checkpoint cadence.
+                try:
+                    tracker.log(metrics)
+                except Exception:
+                    # Training completed safely; preserve it if the reporting service fails.
+                    if not saved:
+                        commit()
+                    raise
             print(json.dumps(metrics), flush=True)
-            completed += 1
-            if args.max_windows is not None and completed >= args.max_windows:
+            if limit_reached or stop_requested:
+                if not saved:
+                    commit()
                 return
         if state.is_open:
             raise ValueError("epoch ended inside a trajectory")
@@ -191,6 +227,8 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--epochs", type=int, default=1, help="total target epochs within this stage, including completed epochs")
     parser.add_argument("--max-windows", type=int, help="stop after this many additional windows")
+    parser.add_argument("--save-every-windows", type=int, default=50,
+                        help="checkpoint every N total windows (default: 50); also save at epoch end and orderly stop")
     parser.add_argument("--wandb-project", help="enable online W&B tracking in this project")
     parser.add_argument("--wandb-entity", help="W&B user or team")
     parser.add_argument("--wandb-name", help="display name of the W&B run")
