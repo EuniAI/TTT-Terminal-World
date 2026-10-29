@@ -5,6 +5,7 @@ import platform
 import random
 import tempfile
 import uuid
+import warnings
 from pathlib import Path
 import torch
 from terminal_world.config import RunConfig, E2E_REVISION, FLASHBOB_REVISION
@@ -122,7 +123,12 @@ def load_checkpoint(path, *, device="cpu", expected_manifest_digest=None, traini
         model = TerminalTransformer(config.model).to(device)
     model.load_state_dict(data["theta"], strict=True)
     model.configure_backend()
-    fast = {k: v.to(device=device).detach().requires_grad_(True) for k, v in data["fast_weights"].items()}
+    old_dtypes = {v.dtype for v in (*data["theta"].values(), *data["fast_weights"].values())}
+    if old_dtypes & {torch.bfloat16, torch.float16}:
+        warnings.warn("Promoting legacy low-precision checkpoint weights/state to FP32 for updates; "
+                      "previously rounded-off updates cannot be recovered.")
+    fast = {k: v.to(device=device, dtype=config.model.parameter_dtype).detach().requires_grad_(True)
+            for k, v in data["fast_weights"].items()}
     model.validate_fast(fast)
     ensure_finite(model.parameters(), "restored theta")
     ensure_finite(fast.values(), "restored phi")
@@ -135,6 +141,11 @@ def load_checkpoint(path, *, device="cpu", expected_manifest_digest=None, traini
     if training:
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.outer_lr, weight_decay=config.training.outer_weight_decay)
         optimizer.load_state_dict(data["optimizer"])
+        # Explicitly retain FP32 moments when migrating a legacy BF16 AdamW state.
+        for parameter, values in optimizer.state.items():
+            for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                if name in values:
+                    values[name] = values[name].to(device=parameter.device, dtype=parameter.dtype)
     if restore_rng:
         random.setstate(data["rng"]["python"])
         torch.set_rng_state(data["rng"]["torch"])

@@ -112,7 +112,10 @@ def run(args):
         raise ValueError("checkpoint cursor/protocol state mismatch")
     model_info = {"theta_parameters": sum(p.numel() for p in model.parameters()),
                   "fast_parameters": sum(p.numel() for p in state.fast_weights.values()),
-                  "backend": config.model.attention_backend, "device": args.device}
+                  "backend": config.model.attention_backend, "device": args.device,
+                  "compute_dtype": str(config.model.torch_dtype),
+                  "parameter_dtype": str(next(model.parameters()).dtype),
+                  "fast_weight_dtype": str(next(iter(state.fast_weights.values())).dtype)}
     print(json.dumps(model_info), flush=True)
     extra = dict(previous.get("extra", {}))
     if stage_source is not None:
