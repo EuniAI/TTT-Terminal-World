@@ -49,7 +49,7 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(h, h, False)
         self.flash_fn = None
 
-    def forward(self, x, positions):
+    def forward(self, x, positions, kv_cache=None):
         c = self.config
         b, n, _ = x.shape
         d = c.hidden_size // c.num_heads
@@ -64,9 +64,31 @@ class Attention(nn.Module):
         def rotate(t):
             return torch.cat((-t[..., d // 2:], t[..., :d // 2]), -1)
         q, k = q * cos + rotate(q) * sin, k * cos + rotate(k) * sin
+        past_length = 0
+        if kv_cache is not None:
+            if "k" in kv_cache:
+                past_length = kv_cache["k"].shape[-2]
+                k = torch.cat((kv_cache["k"], k), dim=-2)
+                v = torch.cat((kv_cache["v"], v), dim=-2)
+            kv_cache.update(k=k, v=v)
         alignment_attention = getattr(self, "_alignment_attention", None)
-        out = (alignment_attention(q, k, v) if alignment_attention is not None
-               else causal_attention(q, k, v, c.attention_backend, self.flash_fn))
+        if past_length:
+            # Cached queries are at the END of the key sequence. A square/top-left
+            # causal mask would incorrectly hide the cached context. Single-token
+            # decoding may attend to every key; chunks need an offset causal mask.
+            ratio = c.num_heads // c.num_kv_heads
+            keys = k.repeat_interleave(ratio, 1) if ratio != 1 else k
+            values = v.repeat_interleave(ratio, 1) if ratio != 1 else v
+            mask = None
+            if n > 1:
+                mask = (torch.arange(k.shape[-2], device=x.device)[None, :]
+                        <= past_length + torch.arange(n, device=x.device)[:, None])
+            # Inference only: native SDPA supports rectangular attention; leave
+            # FlashBoB's differentiable training path unchanged.
+            out = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
+        else:
+            out = (alignment_attention(q, k, v) if alignment_attention is not None
+                   else causal_attention(q, k, v, c.attention_backend, self.flash_fn))
         return self.o_proj(out.transpose(1, 2).reshape(b, n, c.hidden_size))
 
 
@@ -79,8 +101,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.prime_norm = RMSNorm(config.hidden_size, config.rms_norm_eps) if adaptive else None
 
-    def forward(self, x, positions, fast=None, index=None):
-        x = x + self.self_attn(self.input_layernorm(x), positions)
+    def forward(self, x, positions, fast=None, index=None, kv_cache=None):
+        x = x + self.self_attn(self.input_layernorm(x), positions, kv_cache)
         if self.prime_norm is not None and fast is not None:
             x = x + prime_mlp(self.prime_norm(x), fast, f"layers.{index}.prime.")
         return x + self.mlp(self.post_attention_layernorm(x))
@@ -161,6 +183,30 @@ class TerminalTransformer(nn.Module):
         if positions is None:
             positions = torch.arange(ids.shape[1], device=ids.device).expand_as(ids)
         return self.suffix(self.prefix(ids, positions), positions, fast)
+
+    @torch.no_grad()
+    def forward_cached(self, ids, fast, cache=None):
+        """Prefill or extend an event-local cache; return next-token logits.
+
+        The caller must discard this cache when fast weights or model weights
+        change, and at event boundaries. Nothing is stored on the model.
+        """
+        if cache is None:
+            cache = [{} for _ in self.layers]
+        if len(cache) != len(self.layers):
+            raise ValueError("KV cache layer count mismatch")
+        lengths = [entry["k"].shape[-2] if "k" in entry else 0 for entry in cache]
+        if len(set(lengths)) != 1:
+            raise ValueError("KV cache lengths mismatch")
+        start = lengths[0]
+        if ids.shape[1] < 1 or start + ids.shape[1] > self.config.max_seq_len:
+            raise ValueError("empty input or input exceeds model capacity")
+        positions = torch.arange(start, start + ids.shape[1], device=ids.device).expand_as(ids)
+        x = self.embed_tokens(ids)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, positions, fast, i, kv_cache=cache[i])
+        # Generation only needs the final position, especially with large vocabs.
+        return self.lm_head(self.norm(x[:, -1:])), cache
 
 
 def create_model(config, device="cpu"):
