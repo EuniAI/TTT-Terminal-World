@@ -55,13 +55,9 @@ class ModelConfig:
 
     @property
     def torch_dtype(self):
-        """Forward compute dtype; parameters and adaptation state stay in FP32."""
+        """Model parameter, fast-state, and forward compute dtype."""
         return getattr(torch, self.dtype)
 
-    @property
-    def parameter_dtype(self):
-        # Preserve FP64 finite-difference experiments.
-        return torch.float64 if self.dtype == "float64" else torch.float32
 
 
 @dataclass

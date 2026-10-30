@@ -11,13 +11,6 @@ from terminal_world.config import ModelConfig
 from terminal_world.model.attention import causal_attention, validate_flashbob
 
 
-class ComputeLinear(nn.Linear):
-    """FP32 master parameters with differentiable casts for low-precision matmuls."""
-    def forward(self, x):
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
-
-
 class RMSNorm(nn.Module):
     def __init__(self, width, eps):
         super().__init__()
@@ -26,23 +19,23 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         work = x if x.dtype == torch.float64 else x.float()
-        return (work * torch.rsqrt(work.square().mean(-1, keepdim=True) + self.eps)).to(x.dtype) * self.weight.to(x.dtype)
+        return (work * torch.rsqrt(work.square().mean(-1, keepdim=True) + self.eps)).to(x.dtype) * self.weight
 
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         h, m = config.hidden_size, config.intermediate_size
-        self.gate_proj, self.up_proj, self.down_proj = ComputeLinear(h, m, False), ComputeLinear(h, m, False), ComputeLinear(m, h, False)
+        self.gate_proj, self.up_proj, self.down_proj = nn.Linear(h, m, False), nn.Linear(h, m, False), nn.Linear(m, h, False)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 def prime_mlp(x, weights, prefix):
-    gate = F.linear(x, weights[prefix + "gate_proj.weight"].to(x.dtype))
-    up = F.linear(x, weights[prefix + "up_proj.weight"].to(x.dtype))
-    return F.linear(F.silu(gate) * up, weights[prefix + "down_proj.weight"].to(x.dtype))
+    gate = F.linear(x, weights[prefix + "gate_proj.weight"])
+    up = F.linear(x, weights[prefix + "up_proj.weight"])
+    return F.linear(F.silu(gate) * up, weights[prefix + "down_proj.weight"])
 
 
 class Attention(nn.Module):
@@ -50,10 +43,10 @@ class Attention(nn.Module):
         super().__init__()
         self.config = config
         h, d = config.hidden_size, config.hidden_size // config.num_heads
-        self.q_proj = ComputeLinear(h, config.num_heads * d, bias=config.qkv_bias)
-        self.k_proj = ComputeLinear(h, config.num_kv_heads * d, bias=config.qkv_bias)
-        self.v_proj = ComputeLinear(h, config.num_kv_heads * d, bias=config.qkv_bias)
-        self.o_proj = ComputeLinear(h, h, False)
+        self.q_proj = nn.Linear(h, config.num_heads * d, bias=config.qkv_bias)
+        self.k_proj = nn.Linear(h, config.num_kv_heads * d, bias=config.qkv_bias)
+        self.v_proj = nn.Linear(h, config.num_kv_heads * d, bias=config.qkv_bias)
+        self.o_proj = nn.Linear(h, h, False)
         self.flash_fn = None
 
     def forward(self, x, positions):
@@ -102,10 +95,10 @@ class TerminalTransformer(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(Block(config, i >= self.split) for i in range(config.num_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.lm_head = ComputeLinear(config.hidden_size, config.vocab_size, False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, False)
         if config.tie_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
-        self.to(dtype=config.parameter_dtype)
+        self.to(dtype=config.torch_dtype)
         self.eval()
 
     def configure_backend(self):
@@ -154,7 +147,7 @@ class TerminalTransformer(nn.Module):
     def prefix(self, ids, positions):
         if ids.shape[1] > self.config.max_seq_len:
             raise ValueError("input exceeds model capacity")
-        x = self.embed_tokens(ids).to(self.config.torch_dtype)
+        x = self.embed_tokens(ids)
         for i in range(self.split):
             x = self.layers[i](x, positions)
         return x
