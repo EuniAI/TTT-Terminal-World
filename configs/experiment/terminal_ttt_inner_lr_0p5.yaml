@@ -1,0 +1,64 @@
+# Qwen2.5-Coder-3B Base 实验起点；学习率与窗口参数尚未经正式 GPU 调优。
+# 保留底座原结构和 QKV bias，在末 9/36 层（25%）增加同宽 prime MLP。
+# 新增 φ 为 608,698,368 参数，整体约 3.70B；此配置不代表已完成 GPU 验收。
+# hidden_size、intermediate_size、层数、Query/KV 头数、RoPE、归一化和共享 embedding
+# 等架构参数从指定底座读取；词表在底座基础上增加 6 个协议 token。
+# θ 为通用参数，φ 为新增 prime MLP 的 fast weights；φ 跨窗口/轨迹/epoch 持续保留。
+model:
+  # Hugging Face 预训练模型标识或本地权重路径；须符合上述导入限制。
+  model_id: Qwen/Qwen2.5-Coder-3B
+  # 固定底座版本：必须是完整的 40 位小写十六进制 commit SHA，不能填 main。
+  revision: 09d9bc5d376b0cfa0100a0694ea7de7232525803
+  # 显式列出固定底座尺寸，供启动前校验；导入时以 checkpoint 配置为准。
+  vocab_size: 151942  # 原词表 151936 + 6 个终端协议 token
+  hidden_size: 2048
+  intermediate_size: 11008
+  num_layers: 36
+  num_heads: 16
+  num_kv_heads: 2
+  qkv_bias: true  # 只在 Q/K/V 上保留底座 bias，输出投影无 bias
+  rope_theta: 1000000.0
+  rms_norm_eps: 0.000001
+  tie_embeddings: true
+  # 最后多少层增加可适应的 prime MLP，范围为 1 到底座总层数。
+  # 只有 prime MLP 的 gate/up/down 权重属于 φ；普通 MLP 和 normalization 仍属于 θ。
+  # 第一层适应 block 之前是可批量计算的 prefix，其后是必须顺序更新的 suffix。
+  adaptive_layers: 9
+  # 单事件最大序列长度，不能超过底座 max_position_embeddings。
+  # 完整 prompt + max_output_tokens 必须能放下；命令不截断，超长直接报错。
+  max_seq_len: 4096
+  # 使用 FlashBoB 的因果 attention；当前适配器要求 CUDA 和固定 commit 的依赖。
+  # 代码检查 PyTorch 2.8/Triton 3.4 或 2.9/3.5；每头维度须为 32/64/128。
+  # GQA/MQA 还要求 BF16、Query/KV 头数比 <= 32；不兼容时不自动回退到 math。
+  # 接口已接入不等于已完成正式底座上的 GPU 二阶梯度和性能验收。
+  attention_backend: flashbob
+  # 模型与 φ 使用 BF16；低精度 logits 的交叉熵计算转为 FP32。
+  dtype: bfloat16
+training:
+  # 内循环无动量 SGD 学习率：每个事件更新一次 φ；起步值，需实验调优。
+  inner_lr: 0.5
+  # 外循环 AdamW 峰值学习率；每个窗口更新一次 θ。
+  outer_lr: 0.0005
+  # 首次启动按 ceil(训练事件数 / unroll_events) * epochs 固定调度长度。
+  # 从 0 线性预热，再余弦衰减；恢复沿用检查点计划，不重新预热。
+  outer_lr_schedule: warmup_cosine
+  outer_warmup_ratio: 0.1
+  outer_end_lr: 0.00001
+  # 每个元梯度窗口的事件数（含 open/close），必须 >= 2；尾窗口可不足此长度。
+  # 窗口内保留二阶梯度，窗口间只切图；更长窗口通常增加显存需求。
+  # 实验需检查 close → open → 后续 shell 是否落在同一窗口，以覆盖跨轨迹更新效果。
+  unroll_events: 4
+  # 每组批量计算 prefix 的事件数，必须 >= 1；与元梯度窗口大小是不同概念。
+  # 可用较小的连续分组控制前段批量计算规模，suffix 始终按事件顺序更新 φ。
+  prefix_batch_size: 4
+  # 输出 token 预算（使用底座 tokenizer），训练和生成共用，包含 OBS_END。
+  # 训练保留 (正文 + OBS_END) 的前 N 个 token；生成最多 N 个或遇 OBS_END 停止。
+  max_output_tokens: 2048
+  # 内循环全局梯度范数裁剪：阈值 1.0；所有 fast weights 的梯度共同计算范数。
+  # 裁剪可微，并在训练、评估、在线适应中使用相同配置。
+  inner_clip_norm: 1.0
+  # AdamW 对 θ 的权重衰减，0 为关闭；内循环 φ 不应用权重衰减。
+  outer_weight_decay: 0.0
+  # 首次运行的 Python/PyTorch 随机种子；续训恢复检查点中的随机状态。
+  # 不控制 manifest 的数据划分，也不会在每个窗口重新初始化 φ。
+  seed: 0
