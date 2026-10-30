@@ -22,8 +22,10 @@ class Session:
         device = next(self.model.parameters()).device
         ids = torch.tensor([prompt], device=device)
         generated = []
+        cache = None  # Never reuse across events or fast-weight updates.
         for _ in range(self.encoder.max_output_tokens):
-            logits = self.model(ids, self.fast_weights)[:, -1]
+            logits, cache = self.model.forward_cached(ids, self.fast_weights, cache)
+            logits = logits[:, -1]
             ensure_finite([logits], "generation logits")
             # Protocol markers other than OBS_END cannot be generated as output text.
             forbidden = [v for k, v in self.encoder.tokenizer.ids.items() if k != "obs_end"]
@@ -32,7 +34,7 @@ class Session:
             generated.append(token)
             if token == self.encoder.tokenizer.ids["obs_end"]:
                 break
-            ids = torch.cat((ids, torch.tensor([[token]], device=device)), dim=1)
+            ids = torch.tensor([[token]], device=device)
         return generated
 
     def predict(self, command):
