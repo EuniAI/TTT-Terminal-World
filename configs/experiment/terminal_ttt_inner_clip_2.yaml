@@ -56,7 +56,7 @@ training:
   max_output_tokens: 2048
   # 内循环全局梯度范数裁剪：阈值 1.0；所有 fast weights 的梯度共同计算范数。
   # 裁剪可微，并在训练、评估、在线适应中使用相同配置。
-  inner_clip_norm: 1.5
+  inner_clip_norm: 2
   # AdamW 对 θ 的权重衰减，0 为关闭；内循环 φ 不应用权重衰减。
   outer_weight_decay: 0.0
   # 首次运行的 Python/PyTorch 随机种子；续训恢复检查点中的随机状态。
