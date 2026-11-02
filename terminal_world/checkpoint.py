@@ -109,7 +109,7 @@ def load_checkpoint(path, *, device="cpu", expected_manifest_digest=None, traini
     data = torch.load(path, map_location="cpu", weights_only=False)
     required = {"theta", "fast_weights", "config", "tokenizer", "manifest_digest", "manifest",
                 "cursor", "epoch", "is_open", "rng", "runtime", "windows_completed", "mode", "optimizer"}
-    if data.get("format") != 1 or not required <= data.keys() or not data["fast_weights"]:
+    if data.get("format") != 1 or not required <= data.keys():
         raise ValueError("incomplete checkpoint; cannot fall back to initial fast weights")
     if expected_manifest_digest is not None and expected_manifest_digest != data["manifest_digest"]:
         raise ValueError("checkpoint data manifest mismatch")
@@ -136,7 +136,8 @@ def load_checkpoint(path, *, device="cpu", expected_manifest_digest=None, traini
     tokenizer = tokenizer_from_state(data["tokenizer"])
     if tokenizer.vocab_size != config.model.vocab_size:
         raise ValueError("tokenizer/model vocabulary mismatch")
-    encoder = Encoder(tokenizer, config.training.max_output_tokens, config.model.max_seq_len)
+    encoder = Encoder(tokenizer, config.training.max_output_tokens, config.model.max_seq_len,
+                          trajectory_context=config.training.trajectory_context)
     optimizer = None
     if training:
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.outer_lr, weight_decay=config.training.outer_weight_decay)
@@ -159,8 +160,16 @@ def load_checkpoint(path, *, device="cpu", expected_manifest_digest=None, traini
 def resume_session(path, device="cpu"):
     from terminal_world.session import Session
     model, state, _, config, encoder, data = load_checkpoint(path, device=device, training=False, restore_rng=False)
+    history = data["extra"].get("history", [])
+    if encoder.trajectory_context and state.is_open:
+        if data["mode"] == "train":
+            from terminal_world.dataloader.trajectory import EventStream
+            history = EventStream(data["manifest"]).history_before(state.next_cursor, encoder)
+        elif "history" not in data["extra"]:
+            raise ValueError("contextual session checkpoint is missing history")
     session = Session(model, state.fast_weights, encoder, alpha=config.training.inner_lr,
-                      clip_norm=config.training.inner_clip_norm, is_open=state.is_open)
+                      clip_norm=config.training.inner_clip_norm, is_open=state.is_open,
+                      history=history)
     session.observations = data["extra"].get("observations", 0)
     return session
 
@@ -168,4 +177,4 @@ def resume_session(path, device="cpu"):
 def save_session(path, session, config, *, manifest=None, manifest_digest=None):
     state = TrainingState(session.fast_weights, is_open=session.is_open)
     save_checkpoint(path, session.model, state, None, config, session.encoder.tokenizer,
-                    manifest, manifest_digest, mode="session", extra={"observations": session.observations})
+                    manifest, manifest_digest, mode="session", extra={"observations": session.observations, "history": session.history})

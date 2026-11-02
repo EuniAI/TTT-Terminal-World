@@ -54,6 +54,7 @@ def main():
     status(f"Loading checkpoint: {args.checkpoint}")
     model, state, _, config, encoder, data = load_checkpoint(args.checkpoint, device=args.device,
                                                             training=False, restore_rng=False)
+    adapt = bool(config.model.adaptive_layers) and not args.frozen
     status("Verifying test data files...")
     manifest = json.loads(Path(args.manifest).read_text()) if args.manifest else data["manifest"]
     stream = EventStream(manifest, "test")
@@ -67,12 +68,16 @@ def main():
     total = stream.total_events + int(state.is_open)
     status(f"Test data: {len(stream.entries)} trajectories, {total} events (including control events).")
     status("Preparing evaluation model copy...")
-    with tqdm(events, total=total, desc="Eval frozen" if args.frozen else "Eval adapt",
+    with tqdm(events, total=total, desc="Eval adapt" if adapt else "Eval frozen",
               unit="event", file=sys.stderr, dynamic_ncols=True, disable=args.no_progress) as progress:
         result, _ = evaluate(model, state.fast_weights, encoder, progress, alpha=config.training.inner_lr,
-                             clip_norm=config.training.inner_clip_norm, adapt=not args.frozen,
+                             clip_norm=config.training.inner_clip_norm, adapt=adapt,
                              is_open=state.is_open, generate=args.generate)
-    result.update(exposure_label=args.exposure_label, adaptation=not args.frozen,
+    result.update(exposure_label=args.exposure_label, adaptation=adapt,
+                  training_method="ttt" if config.model.adaptive_layers else "sft",
+                  trajectory_context=encoder.trajectory_context,
+                  model_id=config.model.model_id, revision=config.model.revision,
+                  max_output_tokens=encoder.max_output_tokens, max_seq_len=encoder.max_seq_len,
                   source_cursor=state.next_cursor, test_manifest=stream.digest)
     print(json.dumps(result))
 

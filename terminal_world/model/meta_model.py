@@ -67,13 +67,16 @@ def loss_for_window(model, fast, steps, *, alpha, prefix_batch_size=1,
                     pad_id=256, clip_norm=None, serial=False):
     if not steps:
         raise ValueError("empty window")
+    model.validate_fast(fast)
     prefix = [None] * len(steps) if serial else encode_prefix_batch(model, steps, prefix_batch_size, pad_id)
     sums, counts, metrics = [], 0, []
     for step, features in zip(steps, prefix, strict=True):
         nll, n = step_loss(model, fast, step, prefix_output=features)
         ensure_finite([nll], "event loss")
-        fast, stats = inner_loop_step(fast, nll / n, alpha=alpha, create_graph=True,
-                                      clip_norm=clip_norm, return_stats=True)
+        stats = {"update_norm": 0.0, "clipped": False}
+        if model.config.adaptive_layers:
+            fast, stats = inner_loop_step(fast, nll / n, alpha=alpha, create_graph=True,
+                                          clip_norm=clip_norm, return_stats=True)
         sums.append(nll)
         counts += n
         metrics.append({"kind": step.kind, "nll_sum": float(nll.detach()), "tokens": n,

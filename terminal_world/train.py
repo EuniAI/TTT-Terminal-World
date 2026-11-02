@@ -10,7 +10,7 @@ import torch
 from terminal_world.checkpoint import load_checkpoint, save_checkpoint
 from terminal_world.config import RunConfig
 from terminal_world.dataloader.encoding import ByteTokenizer, Encoder
-from terminal_world.dataloader.events import windows
+from terminal_world.dataloader.events import windows, supervised_batches
 from terminal_world.dataloader.trajectory import EventStream
 from terminal_world.metrics import summarize
 from terminal_world.model.loop import TrainingState, train_window
@@ -63,9 +63,9 @@ def _stop_requests():
 
 def run(args):
     if args.epochs < 1 or (args.max_windows is not None and args.max_windows < 1):
-        raise ValueError("epochs and max-windows must be positive")
+        raise ValueError("epochs and max-steps (max-windows) must be positive")
     if getattr(args, "save_every_windows", 50) < 1:
-        raise ValueError("save-every-windows must be positive")
+        raise ValueError("save-every-steps (save-every-windows) must be positive")
     output = Path(args.output)
     stage_from = getattr(args, "start_stage_from", None)
     if stage_from and args.resume:
@@ -106,7 +106,8 @@ def run(args):
         state = TrainingState(fast)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.outer_lr,
                                      weight_decay=config.training.outer_weight_decay)
-        encoder = Encoder(tokenizer, config.training.max_output_tokens, config.model.max_seq_len)
+        encoder = Encoder(tokenizer, config.training.max_output_tokens, config.model.max_seq_len,
+                          trajectory_context=config.training.trajectory_context)
         coverage = {"triples": 0, "covered": 0, "tail": []}
     if stream.state_at(state.next_cursor) != state.is_open:
         raise ValueError("checkpoint cursor/protocol state mismatch")
@@ -115,7 +116,8 @@ def run(args):
                   "backend": config.model.attention_backend, "device": args.device,
                   "compute_dtype": str(config.model.torch_dtype),
                   "parameter_dtype": str(next(model.parameters()).dtype),
-                  "fast_weight_dtype": str(next(iter(state.fast_weights.values())).dtype)}
+                  "training_method": "ttt" if config.model.adaptive_layers else "sft",
+                  "fast_weight_dtype": str(next(iter(state.fast_weights.values())).dtype) if state.fast_weights else None}
     print(json.dumps(model_info), flush=True)
     extra = dict(previous.get("extra", {}))
     if stage_source is not None:
@@ -123,7 +125,8 @@ def run(args):
         extra.pop("wandb", None)  # A new data stage owns a new logging run.
         extra.pop("outer_lr_plan", None)
     if not args.resume:
-        plan = make_schedule(config.training, stream.total_events, args.epochs)
+        plan = make_schedule(config.training, stream.total_events, args.epochs,
+                             events_per_step=events_per_step(config))
         if plan is not None:
             if stage_from:
                 plan["start_window"] = state.windows_completed
@@ -145,12 +148,20 @@ def run(args):
                            commit, tracker, plan, stop_requested)
 
 
+def events_per_step(config):
+    if config.model.adaptive_layers:
+        return config.training.unroll_events
+    return config.training.sft_batch_size or config.training.unroll_events
+
+
 def _train_windows(args, model, state, optimizer, config, encoder, stream, coverage, commit, tracker, plan=None, stop_requested=None):
     completed = 0
     interval = getattr(args, "save_every_windows", 50)
     while state.epoch < args.epochs:
-        for window in windows(stream.from_cursor(state.next_cursor), encoder, config.training.unroll_events,
-                              start_open=state.is_open):
+        batches = windows if config.model.adaptive_layers else supervised_batches
+        for window in batches(stream.from_cursor(state.next_cursor), encoder, events_per_step(config),
+                              start_open=state.is_open,
+                              history=stream.history_before(state.next_cursor, encoder)):
             if stop_requested:
                 commit()
                 return
@@ -215,12 +226,12 @@ def _train_windows(args, model, state, optimizer, config, encoder, stream, cover
         state.epoch += 1
         state.next_cursor = 0
         commit()
-    if coverage["covered"] == 0:
+    if config.model.adaptive_layers and coverage["covered"] == 0:
         print(json.dumps({"notice": "No close/open/shell triple fell in a single window; cross-trajectory meta-gradient coverage is unverified."}), flush=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Persistent-fast-weight terminal meta-training")
+    parser = argparse.ArgumentParser(description="Terminal SFT or persistent-fast-weight TTT training")
     parser.add_argument("--config")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
@@ -229,9 +240,10 @@ def main():
     source.add_argument("--start-stage-from", help="start a new data stage from a completed training checkpoint; preserve weights and AdamW, restart the LR schedule")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--epochs", type=int, default=1, help="total target epochs within this stage, including completed epochs")
-    parser.add_argument("--max-windows", type=int, help="stop after this many additional windows")
-    parser.add_argument("--save-every-windows", type=int, default=50,
-                        help="checkpoint every N total windows (default: 50); also save at epoch end and orderly stop")
+    parser.add_argument("--max-steps", "--max-windows", dest="max_windows", type=int, metavar="N",
+                        help="stop after this many additional optimizer steps; omit to complete --epochs")
+    parser.add_argument("--save-every-steps", "--save-every-windows", dest="save_every_windows", type=int, default=50, metavar="N",
+                        help="checkpoint every N total optimizer steps (default: 50); also save at epoch end and orderly stop")
     parser.add_argument("--wandb-project", help="enable online W&B tracking in this project")
     parser.add_argument("--wandb-entity", help="W&B user or team")
     parser.add_argument("--wandb-name", help="display name of the W&B run")

@@ -1,3 +1,4 @@
+import copy
 import torch
 from terminal_world.dataloader.events import transition
 from terminal_world.model.data import Event
@@ -5,11 +6,12 @@ from terminal_world.model.meta_model import detach_fast, ensure_finite, inner_lo
 
 
 class Session:
-    def __init__(self, model, fast_weights, encoder, *, alpha, clip_norm=None, is_open=False):
+    def __init__(self, model, fast_weights, encoder, *, alpha, clip_norm=None, is_open=False, history=()):
         model.validate_fast(fast_weights)
         self.model, self.fast_weights, self.encoder = model, fast_weights, encoder
         self.alpha, self.clip_norm, self.is_open = alpha, clip_norm, is_open
         self.observations = 0
+        self.history = copy.deepcopy(list(history))
         # Session owns its model. Evaluation must copy before creating a Session.
         self.model.requires_grad_(False)
         self.model.eval()
@@ -18,7 +20,7 @@ class Session:
     def generate_tokens(self, command):
         event = Event("shell", command)
         transition(self.is_open, event)
-        prompt = self.encoder.prompt(event)
+        prompt = self.encoder.prompt(event, self.history)
         device = next(self.model.parameters()).device
         ids = torch.tensor([prompt], device=device)
         generated = []
@@ -45,14 +47,15 @@ class Session:
     @torch.enable_grad()
     def apply_event(self, event, *, adapt=True):
         next_open = transition(self.is_open, event)
-        step = self.encoder.encode(event).to(next(self.model.parameters()).device)
+        step = self.encoder.encode(event, self.history).to(next(self.model.parameters()).device)
         nll, n = step_loss(self.model, self.fast_weights, step)
         ensure_finite([nll], "session loss")
         stats = {"update_norm": 0.0, "clipped": False}
-        if adapt:
+        if adapt and self.model.config.adaptive_layers:
             new_fast, stats = inner_loop_step(self.fast_weights, nll / n, alpha=self.alpha,
                                               create_graph=False, clip_norm=self.clip_norm, return_stats=True)
             self.fast_weights = detach_fast(new_fast)
+        self.encoder.observe(self.history, event)
         self.is_open = next_open
         self.observations += 1
         return {"kind": event.kind, "nll_sum": float(nll.detach()), "tokens": n,

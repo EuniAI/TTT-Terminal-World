@@ -59,13 +59,14 @@ def tokenizer_from_state(state):
 
 
 class Encoder:
-    def __init__(self, tokenizer, max_output_tokens=2048, max_seq_len=4096):
+    def __init__(self, tokenizer, max_output_tokens=2048, max_seq_len=4096, *, trajectory_context=False):
         if max_output_tokens < 1:
             raise ValueError("positive output budget required")
         self.tokenizer = tokenizer
         self.max_output_tokens, self.max_seq_len = max_output_tokens, max_seq_len
+        self.trajectory_context = trajectory_context
 
-    def prompt(self, event):
+    def prompt(self, event, history=()):
         t = self.tokenizer
         if event.kind == "shell":
             prompt = [t.ids["command"]] + t.encode_text(event.command)
@@ -76,10 +77,38 @@ class Encoder:
             prompt = [t.bos_id] + prompt
         if len(prompt) + self.max_output_tokens > self.max_seq_len:
             raise ValueError("full command plus output budget exceeds model capacity")
+        if self.trajectory_context and event.kind == "shell":
+            budget = self.max_seq_len - self.max_output_tokens - len(prompt)
+            kept = []
+            for turn in reversed(history):
+                if len(turn) > budget:
+                    break
+                kept.append(turn)
+                budget -= len(turn)
+            prefix = [token for turn in reversed(kept) for token in turn]
+            # BOS occurs once, at the start of the entire sequence.
+            offset = int(t.bos_id is not None)
+            prompt = prompt[:offset] + prefix + prompt[offset:]
         return prompt
 
-    def encode(self, event):
-        prompt = self.prompt(event)
+    def observe(self, history, event):
+        """Append real observations only; control boundaries discard all history."""
+        if not self.trajectory_context or event.kind == "control":
+            history.clear()
+            return
+        t = self.tokenizer
+        turn = ([t.ids["command"]] + t.encode_text(event.command) + [t.ids["output"]]
+                + t.encode_text(event.output) + [t.ids["obs_end"]])
+        history.append(turn)
+        # Keep a bounded suffix of complete interactions. Current prompts may
+        # retain fewer turns, but do not permanently evict them.
+        budget = self.max_seq_len - self.max_output_tokens
+        size = sum(map(len, history))
+        while history and size > budget:
+            size -= len(history.pop(0))
+
+    def encode(self, event, history=()):
+        prompt = self.prompt(event, history)
         body = self.tokenizer.encode_text(event.output)
         n = self.max_output_tokens
         target = (body + [self.tokenizer.ids["obs_end"]])[:n]

@@ -8,9 +8,11 @@ from terminal_world.checkpoint import load_checkpoint
 from terminal_world.dataloader.trajectory import build_manifest
 
 
+@pytest.mark.parametrize("adaptive_layers", [0, 1])
 @pytest.mark.parametrize("schedule", ["constant", "warmup_cosine"])
 @pytest.mark.parametrize("pause_after", [1, 3])
-def test_cli_resume_across_epochs(tmp_path, tiny, capsys, schedule, pause_after):
+def test_cli_resume_across_epochs(tmp_path, tiny, capsys, schedule, pause_after, adaptive_layers):
+    tiny[3].model.adaptive_layers = adaptive_layers
     tiny[3].training.unroll_events = 5
     tiny[3].training.outer_lr_schedule = schedule
     config = tmp_path / "config.yaml"

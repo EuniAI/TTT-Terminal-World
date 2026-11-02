@@ -83,8 +83,9 @@ def test_import_mapping_and_old_vocabulary_logits():
         import_llama(reference, config)
 
 
+@pytest.mark.parametrize("adaptive_layers", [0, 1])
 @pytest.mark.parametrize("kind", ["llama", "qwen2"])
-def test_real_transformers_adapter_when_available(kind):
+def test_real_transformers_adapter_when_available(kind, adaptive_layers):
     transformers = pytest.importorskip("transformers")
     config_cls = transformers.LlamaConfig if kind == "llama" else transformers.Qwen2Config
     model_cls = transformers.LlamaForCausalLM if kind == "llama" else transformers.Qwen2ForCausalLM
@@ -99,7 +100,7 @@ def test_real_transformers_adapter_when_available(kind):
         for name, parameter in reference.named_parameters():
             if name.endswith(".bias"):
                 parameter.uniform_(-0.2, 0.2)
-    model, fast, _ = importer(reference, ModelConfig(dtype="float64", max_seq_len=128))
+    model, fast, _ = importer(reference, ModelConfig(dtype="float64", max_seq_len=128, adaptive_layers=adaptive_layers))
     ids = torch.tensor([[1, 2, 3, 4], [7, 8, 9, 10]])
     with torch.no_grad():
         expected = reference(ids, use_cache=False).logits

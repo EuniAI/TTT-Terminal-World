@@ -2,10 +2,10 @@
 import math
 
 
-def make_schedule(config, total_events, epochs):
+def make_schedule(config, total_events, epochs, *, events_per_step=None):
     if config.outer_lr_schedule == "constant":
         return None
-    total = math.ceil(total_events / config.unroll_events) * epochs
+    total = math.ceil(total_events / (events_per_step or config.unroll_events)) * epochs
     if total < 3:
         raise ValueError("warmup_cosine requires at least 3 planned training windows")
     # Leave room for both the peak and the final rate, even on tiny runs.

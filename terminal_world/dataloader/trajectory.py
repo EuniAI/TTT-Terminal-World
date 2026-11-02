@@ -140,6 +140,23 @@ class EventStream:
             yield from (e for e in events if e.cursor >= cursor)
             start = end
 
+    def history_before(self, cursor, encoder):
+        """Rebuild SFT context in the current trajectory on training resume."""
+        if not encoder.trajectory_context or not self.state_at(cursor):
+            return []
+        start = 0
+        for entry in self.entries:
+            end = start + entry["steps"] + 2
+            if cursor < end:
+                break
+            start = end
+        history = []
+        for event in self.from_cursor(start):
+            if event.cursor >= cursor:
+                break
+            encoder.observe(history, event)
+        return history
+
 
 def main():
     parser = argparse.ArgumentParser(description="Create an immutable ordered training manifest")

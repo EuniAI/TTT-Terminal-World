@@ -1,0 +1,38 @@
+# 原始 Qwen2.5-Coder-3B 全参数 SFT：无 prime MLP / fast weights。
+# 与 TTT 共用底座 revision、协议、数据顺序和输出预算。
+# outer_lr 为 SFT 的 AdamW 学习率；仅为起点，需在独立验证集调参。
+# inner_lr / inner_clip_norm 为共享配置的占位值，SFT 不使用内循环。
+# sft_batch_size 控制普通 SFT 批量大小；loss 仅覆盖当前输出和 OBS_END。
+model:
+  model_id: Qwen/Qwen2.5-Coder-3B
+  revision: 09d9bc5d376b0cfa0100a0694ea7de7232525803
+  vocab_size: 151942
+  hidden_size: 2048
+  intermediate_size: 11008
+  num_layers: 36
+  num_heads: 16
+  num_kv_heads: 2
+  qkv_bias: true
+  rope_theta: 1000000.0
+  rms_norm_eps: 1.0e-06
+  tie_embeddings: true
+  adaptive_layers: 0
+  max_seq_len: 4096
+  attention_backend: flashbob
+  dtype: bfloat16
+training:
+  # 轨迹内拼接历史真实命令/输出；open/close 清空，超长时丢弃最早完整交互。
+  trajectory_context: true
+  inner_lr: 0.1
+  outer_lr: 2.0e-05
+  outer_lr_schedule: warmup_cosine
+  outer_warmup_ratio: 0.1
+  outer_end_lr: 2.0e-06
+  # 共享配置占位；本 SFT 配置不使用 TTT 窗口或 prefix_batch_size。
+  unroll_events: 4
+  sft_batch_size: 8
+  prefix_batch_size: 4
+  max_output_tokens: 2048
+  inner_clip_norm: 1.0
+  outer_weight_decay: 0.0
+  seed: 0

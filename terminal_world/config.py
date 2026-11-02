@@ -38,8 +38,8 @@ class ModelConfig:
                     "num_heads", "num_kv_heads", "max_seq_len"):
             if getattr(self, key) < 1:
                 raise ValueError(f"{key} must be positive")
-        if not 1 <= self.adaptive_layers <= self.num_layers:
-            raise ValueError("adaptive_layers must select a nonempty suffix")
+        if not 0 <= self.adaptive_layers <= self.num_layers:
+            raise ValueError("adaptive_layers must be in [0, num_layers]; zero selects plain SFT")
         if self.hidden_size % self.num_heads or self.num_heads % self.num_kv_heads:
             raise ValueError("incompatible attention heads")
         if (self.hidden_size // self.num_heads) % 2:
@@ -73,9 +73,16 @@ class TrainConfig:
     outer_lr_schedule: str = "constant"
     outer_warmup_ratio: float = 0.1
     outer_end_lr: float = 1e-5
+    trajectory_context: bool = False
+    # None preserves the batch size of older SFT checkpoints.
+    sft_batch_size: int | None = None
 
     def validate(self):
-        missing = [k for k, v in asdict(self).items() if v is None and k != "inner_clip_norm"]
+        if not isinstance(self.trajectory_context, bool):
+            raise ValueError("trajectory_context must be a boolean")
+        if self.sft_batch_size is not None and (type(self.sft_batch_size) is not int or self.sft_batch_size < 1):
+            raise ValueError("sft_batch_size must be a positive integer")
+        missing = [k for k, v in asdict(self).items() if v is None and k not in ("inner_clip_norm", "sft_batch_size")]
         if missing:
             raise ValueError(f"training configuration is incomplete: {missing}")
         for key in ("inner_lr", "outer_lr"):
@@ -107,6 +114,8 @@ class RunConfig:
     def validate(self):
         self.model.validate()
         self.training.validate()
+        if self.training.trajectory_context and self.model.adaptive_layers:
+            raise ValueError("trajectory_context is supported only for SFT")
 
     def to_dict(self):
         return asdict(self)
