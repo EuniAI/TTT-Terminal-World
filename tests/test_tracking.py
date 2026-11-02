@@ -40,7 +40,14 @@ def test_scalar_metrics_exclude_text_lists_and_nonfinite():
     }
 
 
-def test_wandb_training_resume_preserves_model_and_committed_steps(tmp_path, tiny, sdk):
+@pytest.mark.parametrize("parallel_sft", [False, True])
+def test_wandb_training_resume_preserves_model_and_committed_steps(tmp_path, tiny, sdk, parallel_sft):
+    train = run
+    if parallel_sft:
+        from terminal_world.sft_train import run as train
+        tiny[3].model.adaptive_layers = 0
+        tiny[3].training.sft_batch_size = 4
+        tiny[3].training.trajectory_context = True
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.safe_dump(tiny[3].to_dict()))
     data = tmp_path / "data.jsonl"
@@ -51,14 +58,15 @@ def test_wandb_training_resume_preserves_model_and_committed_steps(tmp_path, tin
     def args(path, resume=None, mode="online", limit=None):
         return Namespace(config=None if resume else str(cfg), manifest=str(manifest), output=str(path),
                          resume=str(resume) if resume else None, device="cpu", epochs=2,
-                         max_windows=limit, wandb_mode=mode, wandb_project="terminal-test")
+                         max_windows=limit, max_steps=limit, save_every_steps=50,
+                         wandb_mode=mode, wandb_project="terminal-test")
     baseline, tracked = tmp_path / "baseline.pt", tmp_path / "tracked.pt"
-    run(args(baseline, mode="disabled"))
-    run(args(tracked, limit=1))
+    train(args(baseline, mode="disabled"))
+    train(args(tracked, limit=1))
     saved = torch.load(tracked, weights_only=False)
     identity = saved["extra"]["wandb"]
     assert saved["windows_completed"] == 1
-    run(args(tracked, resume=tracked))
+    train(args(tracked, resume=tracked))
     assert sdk[0].id == sdk[1].id == identity["id"]
     assert sdk[1].kwargs["resume"] == "must"
     assert sdk[1].kwargs["entity"] == "test-user"
@@ -69,7 +77,9 @@ def test_wandb_training_resume_preserves_model_and_committed_steps(tmp_path, tin
     logged = sdk[0].logs[0]
     assert "train/shell/nll" in logged
     assert "train/boundary_coverage/tail" not in logged
-    assert logged["train/performance/window_compute_seconds"] > 0
+    timing = "step_compute_seconds" if parallel_sft else "window_compute_seconds"
+    assert logged[f"train/performance/{timing}"] > 0
+    assert "train/outer_lr" in logged
     a, b = (torch.load(p, weights_only=False) for p in (baseline, tracked))
     for field in ("theta", "fast_weights"):
         for key in a[field]:

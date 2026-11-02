@@ -8,7 +8,7 @@ import torch
 from terminal_world.checkpoint import load_checkpoint, save_checkpoint
 from terminal_world.config import RunConfig
 from terminal_world.dataloader.encoding import ByteTokenizer, Encoder
-from terminal_world.dataloader.events import supervised_batches
+from terminal_world.dataloader.sft import shell_batches
 from terminal_world.dataloader.trajectory import EventStream
 from terminal_world.metrics import summarize
 from terminal_world.model.loop import TrainingState
@@ -33,8 +33,9 @@ def run(args):
         raise FileExistsError("output checkpoint already exists; use --resume or a new output")
     manifest = json.loads(Path(args.manifest).read_text())
     stream = EventStream(manifest)
-    if not stream.total_events:
-        raise ValueError("training split is empty")
+    shell_count = sum(entry["steps"] for entry in stream.entries)
+    if not shell_count:
+        raise ValueError("training split has no shell samples")
     previous = {}
     stage_source = None
     if args.resume or stage_from:
@@ -46,7 +47,14 @@ def run(args):
         if args.config and RunConfig.load(args.config).to_dict() != config.to_dict():
             raise ValueError("resume config mismatch; use the checkpoint's configuration")
         if stage_from:
-            stage_source = start_new_stage(state, previous, stream)
+            # An old control-inclusive LR horizon can exceed the number of
+            # shell-only updates. Explicitly completed SFT epochs still permit
+            # the next data stage; keep the original plan in its audit record.
+            stage_previous = previous
+            if previous.get("extra", {}).get("sft_stage_complete"):
+                stage_previous = {**previous, "extra": {**previous["extra"], "outer_lr_plan": None}}
+            stage_source = start_new_stage(state, stage_previous, stream)
+            stage_source["outer_lr_plan"] = previous.get("extra", {}).get("outer_lr_plan")
             stage_source["checkpoint"] = str(Path(stage_from).resolve())
     else:
         if not args.config:
@@ -82,12 +90,13 @@ def run(args):
     print(json.dumps(model_info), flush=True)
     extra = dict(previous.get("extra", {}))
     extra["sft_execution"] = "parallel"
+    extra["sft_samples"] = "shell_only"
     if stage_source is not None:
         extra["stage_history"] = [*extra.get("stage_history", []), stage_source]
         extra.pop("wandb", None)  # A new data stage owns a new logging run.
         extra.pop("outer_lr_plan", None)
     if not args.resume:
-        plan = make_schedule(config.training, stream.total_events, args.epochs,
+        plan = make_schedule(config.training, shell_count, args.epochs,
                              events_per_step=(config.training.sft_batch_size or config.training.unroll_events))
         if plan is not None:
             if stage_from:
@@ -100,6 +109,7 @@ def run(args):
         if tracker.identity is not None:
             extra["wandb"] = tracker.identity
         def commit():
+            extra["sft_stage_complete"] = state.epoch >= args.epochs
             save_checkpoint(output, model, state, optimizer, config, encoder.tokenizer,
                             manifest, stream.digest, extra=extra, keep=3)
         # Save identity before the first step, including when enabling logging on an old run.
@@ -115,7 +125,7 @@ def _train_sft(args, model, state, optimizer, config, encoder, stream,
     batch_size = config.training.sft_batch_size or config.training.unroll_events
     device = next(model.parameters()).device
     while state.epoch < args.epochs:
-        batches = supervised_batches(
+        batches = shell_batches(
             stream.from_cursor(state.next_cursor), encoder, batch_size,
             start_open=state.is_open, history=stream.history_before(state.next_cursor, encoder))
         for batch in batches:
@@ -145,7 +155,7 @@ def _train_sft(args, model, state, optimizer, config, encoder, stream,
             metrics.update(loss=loss, epoch=state.epoch, cursor=state.next_cursor,
                            steps=state.windows_completed,
                            windows=state.windows_completed,  # Existing W&B x-axis compatibility.
-                           learning_rate=lr, batch_size=len(batch.steps))
+                           learning_rate=lr, outer_lr=lr, batch_size=len(batch.steps))
             metrics["performance"] = {
                 "step_compute_seconds": seconds,
                 "target_tokens_per_second": sum(r["tokens"] for r in records) / seconds,
@@ -164,8 +174,9 @@ def _train_sft(args, model, state, optimizer, config, encoder, stream,
                 if not saved:
                     commit()
                 return
-        if state.is_open:
-            raise ValueError("epoch ended inside a trajectory")
+        # The iterator consumed trailing controls even if the final full batch
+        # ended on a shell event. Controls do not create optimizer steps.
+        state.is_open = False
         state.epoch += 1
         state.next_cursor = 0
         commit()

@@ -10,6 +10,8 @@ def batch_loss(model, steps, *, pad_id):
         raise ValueError("SFT requires adaptive_layers=0")
     if not steps:
         raise ValueError("empty SFT batch")
+    if any(step.kind != "shell" for step in steps):
+        raise ValueError("SFT batches must contain shell samples only")
     device = next(model.parameters()).device
     steps = [step.to(device) for step in steps]
     shape = (len(steps), max(step.length for step in steps))

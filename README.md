@@ -9,13 +9,14 @@ The full-parameter Qwen2.5-Coder-3B SFT baseline uses
 `python -m terminal_world.sft_train` entry point.
 Setting `adaptive_layers: 0` removes all prime MLPs and inner updates.
 SFT uses ordinary backward/AdamW steps with `sft_batch_size: 8` by default
-in this configuration: eight right-padded samples are processed in one parallel
+in this configuration: eight right-padded shell samples are processed in one parallel
 forward/backward pass, followed by one optimizer update.
 Use the same manifest and training exposure as TTT, then evaluate with
 `--generate --frozen`. Compare `complete.exact_with_end_rate` against TTT
 with and without `--frozen`; also report truncation coverage. SFT keeps real command/output history within each trajectory and clears it
 at trajectory boundaries (`trajectory_context: true`). Only the current output
-contributes to loss. Both training and evaluation retain the most recent complete
+contributes to loss. Open/close events only reset SFT context and never consume
+batch slots or contribute training loss. Both training and evaluation retain the most recent complete
 interactions that fit after reserving the output budget. SFT evaluates without
 parameter updates, adding each real observation to context after prediction. The SFT learning rate is an untuned starting point.
 
