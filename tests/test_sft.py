@@ -50,7 +50,7 @@ def test_sft_config_and_missing_ttt_memory(tiny):
     sft = RunConfig.load("configs/experiment/terminal_sft.yaml")
     ttt = RunConfig.load("configs/experiment/terminal_ttt.yaml")
     assert sft.model.adaptive_layers == 0
-    assert sft.training.sft_batch_size == 8
+    assert sft.training.sft_batch_size == 4
     assert sft.model.model_id == ttt.model.model_id
     assert sft.model.revision == ttt.model.revision
     assert sft.training.max_output_tokens == ttt.training.max_output_tokens

@@ -8,8 +8,8 @@ The full-parameter Qwen2.5-Coder-3B SFT baseline uses
 `configs/experiment/terminal_sft.yaml` with the independent
 `python -m terminal_world.sft_train` entry point.
 Setting `adaptive_layers: 0` removes all prime MLPs and inner updates.
-SFT uses ordinary backward/AdamW steps with `sft_batch_size: 8` by default
-in this configuration: eight right-padded shell samples are processed in one parallel
+SFT uses ordinary backward/AdamW steps with `sft_batch_size: 4` by default
+in this configuration: four right-padded shell samples are processed in one parallel
 forward/backward pass, followed by one optimizer update.
 Use the same manifest and training exposure as TTT, then evaluate with
 `--generate --frozen`. Compare `complete.exact_with_end_rate` against TTT

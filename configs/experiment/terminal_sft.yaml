@@ -30,7 +30,7 @@ training:
   outer_end_lr: 2.0e-06
   # 共享配置占位；本 SFT 配置不使用 TTT 窗口或 prefix_batch_size。
   unroll_events: 4
-  sft_batch_size: 8
+  sft_batch_size: 4
   prefix_batch_size: 4
   max_output_tokens: 2048
   inner_clip_norm: 1.0
