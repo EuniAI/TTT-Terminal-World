@@ -5,10 +5,12 @@
 A research experiment in terminal world models: use **Test-Time Training (TTT)** to learn from ongoing interactions and store observations about the environment in model parameters.
 
 The full-parameter Qwen2.5-Coder-3B SFT baseline uses
-`configs/experiment/terminal_sft.yaml` with the existing training CLI.
+`configs/experiment/terminal_sft.yaml` with the independent
+`python -m terminal_world.sft_train` entry point.
 Setting `adaptive_layers: 0` removes all prime MLPs and inner updates.
 SFT uses ordinary backward/AdamW steps with `sft_batch_size: 8` by default
-in this configuration; larger batches accumulate gradients without TTT unrolling.
+in this configuration: eight right-padded samples are processed in one parallel
+forward/backward pass, followed by one optimizer update.
 Use the same manifest and training exposure as TTT, then evaluate with
 `--generate --frozen`. Compare `complete.exact_with_end_rate` against TTT
 with and without `--frozen`; also report truncation coverage. SFT keeps real command/output history within each trajectory and clears it
