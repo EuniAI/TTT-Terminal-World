@@ -10,7 +10,10 @@ The full-parameter Qwen2.5-Coder-3B SFT baseline uses
 Setting `adaptive_layers: 0` removes all prime MLPs and inner updates.
 SFT uses ordinary backward/AdamW steps with `sft_batch_size: 4` by default
 in this configuration: four right-padded shell samples are processed in one parallel
-forward/backward pass, followed by one optimizer update.
+forward/backward pass, followed by one optimizer update. Launch with
+`torchrun --standalone --nproc_per_node=2 -m terminal_world.sft_train` for two-GPU
+DDP: the global batch stays four (two samples per GPU), with rank-zero-only
+checkpointing and W&B logging. Each GPU retains a full model/optimizer replica.
 Use the same manifest and training exposure as TTT, then evaluate with
 `--generate --frozen`. Compare `complete.exact_with_end_rate` against TTT
 with and without `--frozen`; also report truncation coverage. SFT keeps real command/output history within each trajectory and clears it

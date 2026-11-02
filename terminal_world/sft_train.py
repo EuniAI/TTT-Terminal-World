@@ -15,12 +15,18 @@ from terminal_world.model.loop import TrainingState
 from terminal_world.model.sft import train_batch
 from terminal_world.model.transformer import create_model
 from terminal_world.schedule import make_schedule, outer_learning_rate
-from terminal_world.tracking import start_tracker
+from terminal_world.tracking import start_tracker, Tracker
+from terminal_world.sft_distributed import distributed_context, wrap_model, train_distributed_batch
 # Reuse lifecycle utilities, not the TTT training loop.
 from terminal_world.train import start_new_stage, _stop_requests
 
 
 def run(args):
+    with distributed_context(args) as context:
+        _run(args, context)
+
+
+def _run(args, context):
     if args.epochs < 1 or (args.max_steps is not None and args.max_steps < 1):
         raise ValueError("epochs and max-steps must be positive")
     if getattr(args, "save_every_steps", 50) < 1:
@@ -41,7 +47,8 @@ def run(args):
     if args.resume or stage_from:
         model, state, optimizer, config, encoder, previous = load_checkpoint(
             args.resume or stage_from, device=args.device,
-            expected_manifest_digest=stream.digest if args.resume else None)
+            expected_manifest_digest=stream.digest if args.resume else None, restore_rng=False)
+        context.restore_rng(previous)
         if config.model.adaptive_layers:
             raise ValueError("sft_train requires adaptive_layers=0")
         if args.config and RunConfig.load(args.config).to_dict() != config.to_dict():
@@ -79,15 +86,18 @@ def run(args):
                           trajectory_context=config.training.trajectory_context)
     if stream.state_at(state.next_cursor) != state.is_open:
         raise ValueError("checkpoint cursor/protocol state mismatch")
+    ddp = wrap_model(model, context)
     model_info = {"theta_parameters": sum(p.numel() for p in model.parameters()),
                   "fast_parameters": sum(p.numel() for p in state.fast_weights.values()),
                   "backend": config.model.attention_backend, "device": args.device,
                   "compute_dtype": str(config.model.torch_dtype),
                   "parameter_dtype": str(next(model.parameters()).dtype),
                   "training_method": "sft", "batch_execution": "parallel",
+                  "world_size": context.world_size,
                   "batch_size": config.training.sft_batch_size or config.training.unroll_events,
                   "fast_weight_dtype": str(next(iter(state.fast_weights.values())).dtype) if state.fast_weights else None}
-    print(json.dumps(model_info), flush=True)
+    if context.primary:
+        print(json.dumps(model_info), flush=True)
     extra = dict(previous.get("extra", {}))
     extra["sft_execution"] = "parallel"
     extra["sft_samples"] = "shell_only"
@@ -105,22 +115,26 @@ def run(args):
     plan = extra.get("outer_lr_plan")
     # Fail before writing a checkpoint if a scheduled resume lost its horizon.
     outer_learning_rate(config.training, state.windows_completed, plan)
-    with start_tracker(args, config, state, model_info, stream.digest, extra.get("wandb")) as tracker:
+    tracker = context.root_call(lambda: start_tracker(args, config, state, model_info,
+                                                      stream.digest, extra.get("wandb")))
+    with tracker if context.primary else Tracker() as tracker:
         if tracker.identity is not None:
             extra["wandb"] = tracker.identity
         def commit():
             extra["sft_stage_complete"] = state.epoch >= args.epochs
-            save_checkpoint(output, model, state, optimizer, config, encoder.tokenizer,
-                            manifest, stream.digest, extra=extra, keep=3)
+            extra["sft_distributed_rng"] = context.gather(context.rng_state())
+            context.root_call(lambda: save_checkpoint(
+                output, model, state, optimizer, config, encoder.tokenizer,
+                manifest, stream.digest, extra=extra, keep=3))
         # Save identity before the first step, including when enabling logging on an old run.
         commit()
         with _stop_requests() as stop_requested:
             _train_sft(args, model, state, optimizer, config, encoder, stream,
-                       commit, tracker, plan, stop_requested)
+                       commit, tracker, plan, stop_requested, context, ddp)
 
 
 def _train_sft(args, model, state, optimizer, config, encoder, stream,
-               commit, tracker, plan, stop_requested):
+               commit, tracker, plan, stop_requested, context, ddp):
     completed = 0
     batch_size = config.training.sft_batch_size or config.training.unroll_events
     device = next(model.parameters()).device
@@ -129,7 +143,7 @@ def _train_sft(args, model, state, optimizer, config, encoder, stream,
             stream.from_cursor(state.next_cursor), encoder, batch_size,
             start_open=state.is_open, history=stream.history_before(state.next_cursor, encoder))
         for batch in batches:
-            if stop_requested:
+            if context.any_stop(stop_requested):
                 commit()
                 return
             if device.type == "cuda":
@@ -139,13 +153,18 @@ def _train_sft(args, model, state, optimizer, config, encoder, stream,
             lr = outer_learning_rate(config.training, state.windows_completed, plan)
             for group in optimizer.param_groups:
                 group["lr"] = lr
-            loss, records = train_batch(model, optimizer, state, batch, pad_id=encoder.tokenizer.ids["pad"])
+            if ddp is None:
+                loss, records = train_batch(model, optimizer, state, batch, pad_id=encoder.tokenizer.ids["pad"])
+            else:
+                loss, records = train_distributed_batch(
+                    model, ddp, optimizer, state, batch, pad_id=encoder.tokenizer.ids["pad"], context=context)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             seconds = time.perf_counter() - started
             completed += 1
             done = args.max_steps is not None and completed >= args.max_steps
-            saved = state.windows_completed % args.save_every_steps == 0 or done or bool(stop_requested)
+            stopping = context.any_stop(stop_requested)
+            saved = state.windows_completed % args.save_every_steps == 0 or done or stopping
             checkpoint_seconds = 0.0
             if saved:
                 checkpoint_started = time.perf_counter()
@@ -164,13 +183,14 @@ def _train_sft(args, model, state, optimizer, config, encoder, stream,
             if device.type == "cuda":
                 metrics["performance"]["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
             try:
-                tracker.log(metrics)
+                context.root_call(lambda: tracker.log(metrics))
             except Exception:
                 if not saved:
                     commit()
                 raise
-            print(json.dumps(metrics), flush=True)
-            if done or stop_requested:
+            if context.primary:
+                print(json.dumps(metrics), flush=True)
+            if done or stopping:
                 if not saved:
                     commit()
                 return

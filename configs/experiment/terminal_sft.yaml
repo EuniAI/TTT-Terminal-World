@@ -17,7 +17,8 @@ model:
   rms_norm_eps: 1.0e-06
   tie_embeddings: true
   adaptive_layers: 0
-  max_seq_len: 4096
+  # 使用底座完整 32K 上下文；总预算包含历史、当前命令和当前输出。
+  max_seq_len: 32768
   attention_backend: flashbob
   dtype: bfloat16
 training:
@@ -30,6 +31,7 @@ training:
   outer_end_lr: 2.0e-06
   # 共享配置占位；本 SFT 配置不使用 TTT 窗口或 prefix_batch_size。
   unroll_events: 4
+  # 全局 batch；双卡 torchrun DDP 时每卡 2 条 shell 样本。
   sft_batch_size: 4
   prefix_batch_size: 4
   max_output_tokens: 2048
